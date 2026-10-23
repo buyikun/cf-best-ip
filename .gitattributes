@@ -8,6 +8,7 @@
 *.md    text eol=lf
 *.txt   text eol=lf
 
-# 以下文件只对 Git 有意义，打包(Release)时排除，避免给下载者造成困扰
+# 以下文件只对开发者/Git 有意义，打包(Release)时排除，避免给下载者造成困扰
 .gitattributes  export-ignore
 .gitignore      export-ignore
+DEVELOPMENT.md  export-ignore
