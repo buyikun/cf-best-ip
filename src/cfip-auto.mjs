@@ -17,7 +17,7 @@ import path from 'node:path';
 import net from 'node:net';
 import https from 'node:https';
 import { fileURLToPath } from 'node:url';
-import { pruneOldFiles, loadConfig, findBaseDir } from './cfip-lib.mjs';
+import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib } from './cfip-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = findBaseDir(HERE);   // 根目录（配置与 var\ 所在层），程序可放在 src\ 子目录
@@ -132,55 +132,9 @@ async function noteFreshness(url) {
   } catch { /* 忽略 */ }
 }
 
+// 统一走公共库的 loadSource（支持 HTML 表格源、多源合并、tier 分级）
 async function loadSource() {
-  const s = cfg.source || {};
-  const urls = (s.urls && s.urls.length) ? s.urls : (s.url ? [s.url] : []);
-  const cachePath = s.cacheFile ? path.resolve(CFG_DIR, s.cacheFile) : '';
-
-  if (s.preferUrl !== false && urls.length) {
-    const merged = new Map();
-    let used = 0;
-    for (const u of urls) {
-      const txt = await httpGet(u);
-      const rows = txt ? parseLines(txt) : [];
-      if (!rows.length) { log(`   源不可用或解析为空，跳过：${u}`); if (s.merge) continue; else break; }
-      used++;
-      log(`源：${u}（${rows.length} 个节点）`);
-      await noteFreshness(u);
-      for (const r of rows) {
-        const prev = merged.get(r.ip);
-        const better = !prev || r.fileMbps > prev.fileMbps
-          || (r.fileMbps === prev.fileMbps && r.fileMs > 0 && (!prev.fileMs || r.fileMs < prev.fileMs));
-        if (better) merged.set(r.ip, r);
-      }
-      if (!s.merge) break;
-      if (cachePath) { try { fs.mkdirSync(path.dirname(cachePath), { recursive: true }); fs.writeFileSync(cachePath, txt, 'utf8'); } catch { /* 忽略 */ } }
-    }
-    if (merged.size) {
-      const list = [...merged.values()];
-      if (used > 1) log(`合并去重后共 ${list.length} 个节点，来自 ${used} 个源`);
-      if (cachePath && used > 1) {
-        try {
-          fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-          fs.writeFileSync(cachePath, list.map(r => `${r.ip}:${r.port}#${r.cc} [${r.fileMbps}M]`).join('\n'), 'utf8');
-        } catch { /* 忽略 */ }
-      }
-      return list;
-    }
-    log('   所有线上源均失败，改用本地缓存/文件');
-  }
-
-  if (cachePath && fs.existsSync(cachePath)) {
-    const rows = parseLines(fs.readFileSync(cachePath, 'utf8'));
-    if (rows.length) { log(`源：本地缓存 ${cachePath}（${rows.length} 个节点）`); return rows; }
-  }
-
-  const file = s.file;
-  if (!file || !fs.existsSync(file)) throw new Error(`线上源不可用，本地文件也不存在: ${file}`);
-  const ageMin = (Date.now() - fs.statSync(file).mtimeMs) / 60000;
-  log(`源：${file}（${ageMin.toFixed(0)} 分钟前更新）`);
-  if (s.maxAgeMinutes > 0 && ageMin > s.maxAgeMinutes) log(`   警告：文件已超过 maxAgeMinutes=${s.maxAgeMinutes}，可能是旧数据`);
-  return parseLines(fs.readFileSync(file, 'utf8'));
+  return loadSourceLib(cfg.source, CFG_DIR, log);
 }
 
 // ── 探针 ──────────────────────────────────────────────────────────
@@ -360,7 +314,15 @@ try {
     else if (VERBOSE) log(`   x ${c.ip} 粗筛失败(${d.err})`);
   });
   log(`HTTP 粗筛通过：${screened.length}/${testList.length}`);
-  if (!screened.length) throw new Error('没有节点能完成下载（可能是网络故障或数据全部过期），保留现有 DNS 记录');
+  if (!screened.length) {
+    throw new Error(
+      `HTTP 粗筛 ${testList.length} 个节点全部失败，现有 DNS 记录保持不变。\n`
+      + `     排查建议：\n`
+      + `       1) 数据源可能整体失效（查日志里"上游已 N 小时未更新"的告警）\n`
+      + `       2) 网络异常，试试浏览器能否打开 https://speed.cloudflare.com\n`
+      + `       3) 若手动调小了 --candidates，请恢复默认（默认 150，太小容易全挂）`
+    );
+  }
 
   // 5. 多轮正式测速（串行，避免互抢带宽导致排名失真）
   const rounds = Math.max(1, cfg.probe.rounds);

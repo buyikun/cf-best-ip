@@ -522,17 +522,44 @@ export function mergeConfig(base, override) {
 export function loadConfig(basePath, userPath) {
   const base = parseJsonc(fs.readFileSync(basePath, 'utf8'));
   let user = null;
+  let userError = '';          // 用户配置文件解析失败的原因（用于友好提示）
   if (userPath && fs.existsSync(userPath)) {
-    try { user = parseJsonc(fs.readFileSync(userPath, 'utf8')); } catch (e) { user = null; }
+    try {
+      user = parseJsonc(fs.readFileSync(userPath, 'utf8'));
+    } catch (e) {
+      // 常见错误给出人话提示，而不是让用户以为"没配置"
+      const raw = fs.readFileSync(userPath, 'utf8');
+      const msg = String(e.message || e);
+      if (/Unexpected token|Expected|property name|after property value/i.test(msg)) {
+        const m = msg.match(/position (\d+)/);
+        let hint = '';
+        if (m) {
+          const pos = Number(m[1]);
+          const before = raw.slice(0, pos);
+          const line = before.split(/\r?\n/).length;
+          const col = pos - before.lastIndexOf('\n');
+          hint = `（第 ${line} 行第 ${col} 列附近）`;
+        }
+        userError = `配置文件 ${path.basename(userPath)} 格式有误${hint}：${msg}\n     常见原因：多写了逗号、少了逗号、用了单引号(要用双引号)、注释符号没闭合`;
+      } else {
+        userError = `配置文件 ${path.basename(userPath)} 读取失败：${msg}`;
+      }
+      user = null;
+    }
   }
   const cfg = user ? mergeConfig(base, user) : base;
   const ucf = (user && user.cloudflare) || {};
-  const uploadReady = !!(ucf.apiToken && ucf.zoneId && Array.isArray(ucf.records) && ucf.records.length);
+  // 逐项判断缺失了什么，便于给出精确提示
+  const missing = [];
+  if (!ucf.apiToken) missing.push('apiToken');
+  if (!ucf.zoneId) missing.push('zoneId');
+  if (!Array.isArray(ucf.records) || !ucf.records.length) missing.push('records');
+  const uploadReady = missing.length === 0;
   // 无论默认配置里写了什么，上传信息一律以用户文件为准
   cfg.cloudflare = uploadReady
     ? ucf
     : { ...(ucf || {}), apiToken: '', zoneId: '', records: [] };
-  return { cfg, user, userPath, uploadReady };
+  return { cfg, user, userPath, uploadReady, missing, userError, userConfigExists: !!(userPath && fs.existsSync(userPath)) };
 }
 
 // ── 清理旧文件：备份 / 日志只保留最近 N 份 ────────────────────────

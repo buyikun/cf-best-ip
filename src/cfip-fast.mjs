@@ -37,7 +37,7 @@ const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] 
 
 const CONFIG_PATH = path.resolve(HERE, opt('--config', 'cfip.config.json'));   // 内置默认配置随程序在 src\
 const USER_CONFIG_PATH = path.resolve(BASE, opt('--user-config', 'user.config.jsonc'));  // 用户配置在根目录
-const { cfg, userPath, uploadReady } = loadConfig(CONFIG_PATH, USER_CONFIG_PATH);
+const { cfg, userPath, uploadReady, missing, userError, userConfigExists } = loadConfig(CONFIG_PATH, USER_CONFIG_PATH);
 if (!uploadReady) cfg.behavior.dryRun = true;   // 没填凭据 = 强制只测速，绝不写 DNS
 const DRY = flag('--dry-run') || cfg.behavior.dryRun === true;
 const F = {
@@ -76,17 +76,34 @@ const TOKEN = process.env.CF_TOKEN || cfg.cloudflare.apiToken;
 const ZONE = process.env.CF_ZONE || cfg.cloudflare.zoneId;
 
 log('=========== CF 优选（快速早停方案）开始 ===========');
-log(`配置：${path.basename(CONFIG_PATH)}${uploadReady ? ' + ' + path.basename(userPath) : '（未配置用户变量文件）'}`);
+log(`配置：${path.basename(CONFIG_PATH)}${uploadReady ? ' + ' + path.basename(userPath) : (userConfigExists ? '（用户配置存在但未填全）' : '（未配置用户变量文件）')}`);
 if (!uploadReady) {
   log('');
-  log('  ┌────────────────────────────────────────────────────────────┐');
-  log('  │  还没有配置 Cloudflare，本次运行 = 演示模式                │');
-  log('  │  · 只测速、只打印结果，绝不会改动你的 DNS                  │');
-  log('  │  · 想正式使用：用记事本打开 user.config.jsonc，填三样：    │');
-  log('  │      apiToken / zoneId / records（文件里每项都有中文说明） │');
-  log('  └────────────────────────────────────────────────────────────┘');
-  log('');
-  // 演示模式：缩小规模，几十秒就出结果
+  // 配置写错时先给出明确的错误，别让用户以为是"没配置"
+  if (userError) {
+    log('  ┌────────────────────────────────────────────────────────────┐');
+    log('  │  ⚠ 你的配置文件有问题，已退回"只测速"模式                  │');
+    log('  └────────────────────────────────────────────────────────────┘');
+    log(`  ${userError}`);
+    log('');
+  } else if (userConfigExists && missing && missing.length) {
+    log('  ┌────────────────────────────────────────────────────────────┐');
+    log('  │  配置文件已找到，但还缺少上传必需项，本次 = 只测速模式      │');
+    log('  └────────────────────────────────────────────────────────────┘');
+    log(`  未填的项：${missing.join(' / ')}`);
+    log('  提示：这三项都要填齐才会真正上传（文件里每项都有中文说明）');
+    log('');
+  } else {
+    log('  ┌────────────────────────────────────────────────────────────┐');
+    log('  │  还没有配置 Cloudflare，本次运行 = 演示模式                │');
+    log('  │  · 只测速、只打印结果，绝不会改动你的 DNS                  │');
+    log('  │  · 想正式使用：把 user.config.jsonc.example 改名为         │');
+    log('  │      user.config.jsonc，然后填三样：                        │');
+    log('  │      apiToken / zoneId / records（文件里每项都有中文说明） │');
+    log('  └────────────────────────────────────────────────────────────┘');
+    log('');
+  }
+  // 只测速模式：缩小规模，几十秒就出结果
   F.maxProbe = Math.min(Number(F.maxProbe) || 80, 8);
   F.targetCount = Math.min(Number(F.targetCount) || 10, 3);
   F.minProbe = Math.min(Number(F.minProbe) || 60, 4);
