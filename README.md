@@ -178,17 +178,35 @@
 
 ## 订阅源
 
-`source.urls` 里按顺序合并（`merge: true`）以下 4 路：
+`source.urls` 支持两种写法：纯字符串，或 `{url, tier, name}` 对象。
 
-```
-raw.githubusercontent.com/HandsomeMJZ/cfip/.../full_ips.txt   ← 主源
-cf.junzhen.qzz.io/full_ips.txt                                ← 上游 README 推荐的 R2 线路
-cf.junzhen.qzz.io/full_ips_bj.txt                             ← 北京电信线路
-cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt        ← jsDelivr 镜像
+```jsonc
+"urls": [
+  { "url": "https://api.uouin.com/cloudflare.html", "tier": "fresh",  "name": "麒麟优选" },
+  { "url": "https://cf.junzhen.qzz.io/full_ips.txt", "tier": "fresh",  "name": "junzhen四川联通" },
+  { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" },
+  { "url": "https://raw.githubusercontent.com/HandsomeMJZ/cfip/...", "tier": "legacy", "name": "GitHub主源" }
+]
 ```
 
-> ⚠️ 实测这些上游数据本身较旧（GitHub 主源最后提交 2026-09-07），标称高速的节点大面积失效。
-> 所以两种方案都**不信任标称值**，一律本地重测；每轮还会查 GitHub commit 时间，超过 6 小时打印过期告警。
+**两种格式都能解析**：
+- 纯文本订阅（`1.2.3.4:443#JP [7M]`、`1.2.3.4:443#JP [45ms 12Mbps]`）
+- **HTML 表格**（如麒麟优选 `api.uouin.com/cloudflare.html`，自动识别 `序号/运营商/IP/丢包率` 四列）
+  运营商会映射成 `TEL/UNI/CMB` 存进 `cc` 字段，所以国家码过滤也能用
+
+### 数据源按「历史表现」动态分级
+
+这是本项目的一个核心设计——**不是按配置顺序死板地测，而是按每个源的实际表现排序**：
+
+1. 每次运行记录各源的「测了几个 / 中了几个 / 平均速度」，存进 `var/source-stats.json`
+2. 下次运行时按命中率排序（贝叶斯平滑，避免小样本极端值），表现好的源**优先测**
+3. `tier` 只作底色：`fresh` 基础分 0.6，`legacy` 基础分 0.55
+4. 表现记录 14 天后自动作废（`sourceStatTtlDays`）
+
+实测效果：某个源上一轮测 8 个只中 1 个，下一轮它的得分就从 0.60 掉到 0.48，排到队尾。
+
+> ⚠️ 上游数据质量差异很大：GitHub 主源最后提交 2026-09-07，标称高速的节点大面积失效。
+> 所以两种方案都**不信任标称值**，一律本地重测；还会查 GitHub commit 时间，超过 6 小时打印过期告警。
 > 线上全部拉不到时回退 `var/cache/full_ips.txt`，再不行才用本地快照。
 
 ## 关键参数速查（cfip.config.json）

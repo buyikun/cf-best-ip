@@ -58,6 +58,60 @@ export function parseLines(text, defaultPort = 443) {
   return out.filter(r => (seen.has(r.ip) ? false : (seen.add(r.ip), true)));
 }
 
+/**
+ * 解析 HTML 页面里的优选 IP 表格（如 api.uouin.com/cloudflare.html）
+ * 页面结构：每行 = 序号 | 运营商(电信/联通/移动) | IP | 丢包率
+ * 没有端口信息 -> 默认 443
+ * 返回格式与 parseLines 一致，cc 字段借用运营商（TEL/UNI/CMB），filter 也能用
+ */
+export function parseHtmlTable(html) {
+  const out = [];
+  const carrierMap = { '电信': 'TEL', '联通': 'UNI', '移动': 'CMB' };
+  // 匹配每个 <tr>...</tr> 里的 <td> 内容
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rm;
+  while ((rm = rowRe.exec(html))) {
+    const cells = [...rm[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)]
+      .map(c => c[1].replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim());
+    if (cells.length < 3) continue;
+    // 找一个形如 IP 的单元格
+    const ipIdx = cells.findIndex(c => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(c));
+    if (ipIdx < 0) continue;
+    const ip = cells[ipIdx];
+    const carrierRaw = cells.slice(0, ipIdx).find(c => carrierMap[c]) || '';
+    out.push({
+      ip,
+      port: Number(defaultPortOf()),
+      cc: carrierMap[carrierRaw] || '',
+      carrier: carrierRaw,
+      fileMs: 0,
+      fileMbps: 0
+    });
+  }
+  const seen = new Set();
+  return out.filter(r => (seen.has(r.ip) ? false : (seen.add(r.ip), true)));
+}
+
+function defaultPortOf() {
+  return 443;
+}
+
+/** 判断一段文本是不是 HTML（而不是纯文本订阅） */
+export function looksLikeHtml(text) {
+  const head = text.slice(0, 400).toLowerCase();
+  return head.includes('<!doctype html') || head.includes('<html') || (head.includes('<table') && head.includes('<tr'));
+}
+
+/** 智能解析：HTML 表格 或 纯文本订阅 都支持 */
+export function parseAny(text, defaultPort = 443) {
+  if (!text) return [];
+  if (looksLikeHtml(text)) {
+    const rows = parseHtmlTable(text);
+    return rows.length ? rows : [];
+  }
+  return parseLines(text, defaultPort);
+}
+
 export async function httpGet(url, timeout = 20000) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
@@ -95,25 +149,39 @@ export async function loadSource(sourceCfg, cfgDir, log) {
   if (s.preferUrl !== false && urls.length) {
     const merged = new Map();
     let used = 0;
-    for (const u of urls) {
+    for (const entry of urls) {
+      // 每个源可以是纯字符串，也可以是 {url, tier:'fresh'|'legacy', name}
+      const u = typeof entry === 'string' ? entry : entry.url;
+      const tier = (typeof entry === 'object' && entry.tier) || 'fresh';
+      const label = (typeof entry === 'object' && entry.name) || '';
+      if (!u) continue;
       const txt = await httpGet(u);
-      const rows = txt ? parseLines(txt) : [];
+      const rows = txt ? parseAny(txt) : [];          // 自动兼容 HTML 表格与纯文本订阅
       if (!rows.length) { log(`   源不可用或解析为空，跳过：${u}`); if (s.merge) continue; else break; }
       used++;
-      log(`源：${u}（${rows.length} 个节点）`);
+      const kind = txt && looksLikeHtml(txt) ? 'HTML表格' : '纯文本';
+      const tag = tier === 'legacy' ? '旧源' : '新鲜源';
+      log(`源：${u}${label ? ` [${label}]` : ''}（${rows.length} 个节点，${kind}，${tag}）`);
       await noteFreshness(u, log);
       for (const r of rows) {
         const prev = merged.get(r.ip);
-        const better = !prev || r.fileMbps > prev.fileMbps
-          || (r.fileMbps === prev.fileMbps && r.fileMs > 0 && (!prev.fileMs || r.fileMs < prev.fileMs));
-        if (better) merged.set(r.ip, r);
+        // 同 IP 重复出现时：优先保留"新鲜源"的记录；同档内保留速度标注更高的
+        const prevBetterTier = prev && (prev.tier !== 'legacy');
+        const curBetterTier = tier !== 'legacy';
+        const better = !prev
+          || (!prevBetterTier && curBetterTier)
+          || (prev.tier === tier && r.fileMbps > prev.fileMbps)
+          || (prev.tier === tier && r.fileMbps === prev.fileMbps && r.fileMs > 0 && (!prev.fileMs || r.fileMs < prev.fileMs));
+        if (better) merged.set(r.ip, { ...r, tier, sourceLabel: label || u });
       }
       if (!s.merge) break;
       if (cachePath) { try { fs.mkdirSync(path.dirname(cachePath), { recursive: true }); fs.writeFileSync(cachePath, txt, 'utf8'); } catch { /* 忽略 */ } }
     }
     if (merged.size) {
       const list = [...merged.values()];
-      if (used > 1) log(`合并去重后共 ${list.length} 个节点，来自 ${used} 个源`);
+      const nFresh = list.filter(r => r.tier !== 'legacy').length;
+      const nLegacy = list.length - nFresh;
+      log(`合并去重后共 ${list.length} 个节点（新鲜源 ${nFresh} 个 / 旧源 ${nLegacy} 个）`);
       if (cachePath && used > 1) {
         try {
           fs.mkdirSync(path.dirname(cachePath), { recursive: true });

@@ -47,6 +47,7 @@ const F = {
   bandwidthCacheFile: 'var/bandwidth.json', bandwidthCacheHours: 24, bandwidthSeconds: 4,
   targetMbps: 0, targetTtlDays: 30, healthCheck: true, qualityGuard: true, guardRatio: 0.5,
   fallbackAfterProbes: 30, localBandwidthMbps: 0,
+  sourceStatFile: 'var/source-stats.json', sourceStatTtlDays: 14, sourceStatWarmup: 30,
   ...(cfg.fast || {})
 };
 if (opt('--target')) F.targetMbps = Number(opt('--target'));
@@ -60,6 +61,7 @@ const BAK_DIR = path.resolve(CFG_DIR, cfg.behavior.backupDir || 'var/backups');
 const STATE_FILE = path.resolve(CFG_DIR, cfg.behavior.stateFile || 'var/state-fast.json');
 const HISTORY_FILE = path.resolve(CFG_DIR, F.historyFile || 'var/history.json');
 const BW_FILE = path.resolve(CFG_DIR, F.bandwidthCacheFile || 'var/bandwidth.json');
+const STAT_FILE = path.resolve(CFG_DIR, F.sourceStatFile || 'var/source-stats.json');
 const RUN_ID = new Date().toISOString().replace(/[:.]/g, '-');
 const { log, flush } = createLogger(LOG_DIR, RUN_ID);
 fs.mkdirSync(BAK_DIR, { recursive: true });
@@ -156,7 +158,7 @@ try {
   }
   log(`达标线：${target}Mbps（${targetSrc}）`);
 
-  // 3. 现状体检：在用 IP 还达标就不折腾（快速模式要的是可用）
+  // 3. 现状体检：DNS 里正在用的 IP 达标就不折腾（快速模式的初衷：可用即可）
   if (F.healthCheck && curIps.length) {
     log('---- 现状体检 ----');
     const healthRounds = Math.max(1, Number(F.healthRounds ?? 2));
@@ -183,24 +185,66 @@ try {
     log(`   仅 ${good.length} 个仍达标（需要 ${need} 个），进入重新优选`);
   }
 
-  // 4. 拉源 + 排序（在用 IP → 历史活节点 → 标注速度）
+  // 4. 拉源 + 按「数据源历史表现」动态排序
   const all = await loadSource(cfg.source, CFG_DIR, log);
   log(`源记录：${all.length} 条，其中带速度标注 ${all.filter(r => r.fileMbps > 0).length} 条`);
   if (!all.length) throw new Error('源里没有可解析的 IP');
 
-  const histRanked = all.filter(r => fresh[r.ip]).sort((a, b) => fresh[b.ip].mbps - fresh[a.ip].mbps);
+  // ── 读数据源表现档案，算出每个源的优先级分数 ──────────────────
+  // 档案记录每次运行中「该源贡献了多少个达标节点 / 测了多少个 / 平均速度」
+  const statStore = readJson(STAT_FILE, { sources: {} });
+  const statTtlMs = Number(F.sourceStatTtlDays ?? 14) * 86400000;
+  const srcStats = {};
+  for (const [label, v] of Object.entries(statStore.sources || {})) {
+    if (!v || !v.updatedAt) continue;
+    if (now - Date.parse(v.updatedAt) > statTtlMs) continue;      // 太久没更新的表现记录作废
+    srcStats[label] = v;
+  }
+  // 优先级分数 = 历史命中率（达标数/测试数），小样本用贝叶斯平滑避免极端值
+  // 命中率高的源优先；平均速度只做小幅加权；tier 只作基础底色（新鲜源略优）
+  function scoreOf(label, tier) {
+    const s = srcStats[label];
+    const base = tier === 'legacy' ? 0.55 : 0.6;      // 同类源的基础分
+    if (!s || (s.tested || 0) === 0) return base;      // 真正冷启动：给基础分
+    const tested = s.tested || 0, hit = s.hit || 0;
+    // 贝叶斯平滑：先验 20% 命中率、权重 8 次（小样本会向 0.2 收敛，样本多了才信实测）
+    const smoothed = (hit + 0.2 * 8) / (tested + 8);
+    const speedFactor = Math.min(1, (s.avgMbps || 0) / 20);
+    // 平滑命中率为主（权重 1.0），速度微调（最多 +0.2），整体乘 tier 底色
+    return +(base * (0.4 + smoothed * 1.2 + speedFactor * 0.2)).toFixed(3);
+  }
+  // 给每个节点打上所属源的优先级分数
+  const withScore = all.map(r => {
+    const label = r.sourceLabel || r.tier || 'unknown';
+    return { ...r, srcLabel: label, srcScore: scoreOf(label, r.tier) };
+  });
+
+  // 排序：历史实测过的活节点最优先 → 源分数高的优先 → 同源内标注速度高的优先
+  const histRanked = withScore.filter(r => fresh[r.ip]).sort((a, b) => fresh[b.ip].mbps - fresh[a.ip].mbps);
   const histIps = new Set(histRanked.map(r => r.ip));
-  const rest = all.filter(r => !histIps.has(r.ip) && r.port === P)
-    .sort((a, b) => (b.fileMbps - a.fileMbps) || (a.fileMs - b.fileMs));
-  const restOther = all.filter(r => !histIps.has(r.ip) && r.port !== P)
-    .sort((a, b) => (b.fileMbps - a.fileMbps) || (a.fileMs - b.fileMs));
-  const curRanked = curIps.map(ip => all.find(r => r.ip === ip) || { ip, port: P, cc: '', fileMs: 0, fileMbps: 0 });
+  const restAll = withScore.filter(r => !histIps.has(r.ip) && r.port === P)
+    .sort((a, b) => (b.srcScore - a.srcScore) || (b.fileMbps - a.fileMbps) || (a.fileMs - b.fileMs));
+  const curRanked = curIps.map(ip => withScore.find(r => r.ip === ip) || { ip, port: P, cc: '', fileMs: 0, fileMbps: 0, srcLabel: '(现用)', srcScore: 9 });
   const seenIp = new Set();
-  const queue = [...curRanked, ...histRanked, ...rest, ...restOther]
+  const queue = [...curRanked, ...histRanked, ...restAll]
     .filter(r => (seenIp.has(r.ip) ? false : (seenIp.add(r.ip), true)))
     .slice(0, F.maxProbe)
     .map(r => ({ ...r, port: P }));
-  log(`候选队列：${queue.length} 个（在用 ${curIps.length} + 历史活节点 ${histRanked.length} 优先复测）`);
+
+  // 打印源优先级，方便观察分级是否合理
+  const bySrc = {};
+  for (const r of withScore) {
+    const k = r.srcLabel;
+    (bySrc[k] ||= { n: 0, score: r.srcScore, tier: r.tier });
+    bySrc[k].n++;
+  }
+  log('---- 数据源优先级（历史表现 + 新鲜度）----');
+  Object.entries(bySrc).sort((a, b) => b[1].score - a[1].score).forEach(([k, v]) => {
+    const s = srcStats[k];
+    const hist = s ? `  上次: 测${s.tested}中${s.hit}达标 均速${(s.avgMbps || 0).toFixed(1)}Mbps` : '  (暂无历史)';
+    log(`   ${v.score.toFixed(2)}  ${k.padEnd(28)} ${String(v.n).padStart(4)}个${hist}`);
+  });
+  log(`候选队列：${queue.length} 个（按源优先级排序测试）`);
 
   // 5. 顺序测试 + 早停
   const tested = new Map();
@@ -223,15 +267,49 @@ try {
     const d = await download(c.ip, c.port, F.probeBytes, F.probeTimeoutMs);
     tested.set(c.ip, d);
     if (d.ok && d.mbps >= target) {
-      collected.push({ ip: c.ip, cc: c.cc, port: c.port, mbps: d.mbps, ttfb: d.ttfb });
+      collected.push({ ip: c.ip, cc: c.cc, port: c.port, mbps: d.mbps, ttfb: d.ttfb, srcLabel: c.srcLabel || '' });
       const shown = Math.min(collected.length, F.targetCount);
-      log(`   [${shown}/${F.targetCount}] ${c.ip} ${c.cc} ${d.mbps}Mbps/${d.ttfb}ms`);
+      const srcTag = c.srcLabel ? ` 〔${c.srcLabel.slice(0, 12)}〕` : '';
+      log(`   [${shown}/${F.targetCount}] ${c.ip} ${c.cc} ${d.mbps}Mbps/${d.ttfb}ms${srcTag}`);
       if (collected.length >= F.targetCount) {
         if (tested.size >= minProbe) { stopped = true; log(`   已凑够 ${F.targetCount} 个达标节点，提前停止（共测 ${tested.size} 个，队列还剩 ${queue.length - tested.size} 个没测）`); }
         else if (!warned) { warned = true; log(`   已凑够 ${F.targetCount} 个，为保证质量继续多测到 ${minProbe} 个再停`); }
       }
     } else if (!d.ok && cfg.behavior.verbose) log(`   - ${c.ip} 不通(${d.err})`);
   });
+
+  // ── 更新数据源表现档案（供下次按表现排序）────────────────────
+  {
+    const per = {};
+    for (const [ip, d] of tested.entries()) {
+      const q = queue.find(x => x.ip === ip);
+      const label = q?.srcLabel || 'unknown';
+      (per[label] ||= { tested: 0, hit: 0, sumMbps: 0, okCount: 0 });
+      per[label].tested++;
+      if (d.ok) { per[label].okCount++; per[label].sumMbps += d.mbps; }
+      if (d.ok && d.mbps >= target) per[label].hit++;
+    }
+    const store = readJson(STAT_FILE, { sources: {} });
+    store.sources ||= {};
+    for (const [label, v] of Object.entries(per)) {
+      const old = store.sources[label] || {};
+      // 指数滑动平均，让近期表现权重更高（旧记录占 60%，本次占 40%）
+      const blend = (a, b, w = 0.4) => (a == null ? b : a * (1 - w) + b * w);
+      store.sources[label] = {
+        tested: Math.round(blend(old.tested, v.tested)),
+        hit: Math.round(blend(old.hit, v.hit)),
+        avgMbps: +blend(old.avgMbps, v.okCount ? v.sumMbps / v.okCount : 0).toFixed(2),
+        lastRun: { tested: v.tested, hit: v.hit, at: new Date().toISOString() },
+        updatedAt: new Date().toISOString()
+      };
+    }
+    writeJson(STAT_FILE, store);
+    log('---- 数据源本轮表现（已记入档案，下次按此排序）----');
+    for (const [label, v] of Object.entries(per)) {
+      const rate = v.tested ? Math.round((v.hit / v.tested) * 100) : 0;
+      log(`   ${label.padEnd(28)} 测${String(v.tested).padStart(3)} 中${String(v.hit).padStart(2)} (${rate}%)`);
+    }
+  }
   log(`探测结束：共测 ${tested.size} 个，达标 ${collected.length} 个（达标线 ${target}Mbps）`);
   if (!tested.size) throw new Error('一个节点都没测成，保留现有 DNS 记录不变');
 

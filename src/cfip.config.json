@@ -9,12 +9,13 @@
   },
 
   "source": {
-    "_说明": "多个线上订阅合并去重后一起实测；全部失败才用本地缓存/快照。",
+    "_说明": "多源合并去重。tier=fresh 表示高频更新的源（优先测），tier=legacy 表示更新慢的旧源（垫后测）。",
     "urls": [
-      "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt",
-      "https://cf.junzhen.qzz.io/full_ips.txt",
-      "https://cf.junzhen.qzz.io/full_ips_bj.txt",
-      "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt"
+      { "url": "https://api.uouin.com/cloudflare.html", "tier": "fresh", "name": "麒麟优选(HTML,高频更新)" },
+      { "url": "https://cf.junzhen.qzz.io/full_ips.txt", "tier": "fresh", "name": "junzhen四川联通" },
+      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" },
+      { "url": "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt", "tier": "legacy", "name": "GitHub主源(较旧)" },
+      { "url": "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt", "tier": "legacy", "name": "jsDelivr镜像(较旧)" }
     ],
     "merge": true,
     "preferUrl": true,
