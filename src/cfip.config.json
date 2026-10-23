@@ -1,0 +1,83 @@
+{
+  "_说明": "程序内置默认参数。你要改的变量请写在 user.config.jsonc（用户变量文件）里。本文件的 cloudflare 段只是占位，填什么都不会被使用。",
+
+  "cloudflare": {
+    "_说明": "占位：Cloudflare 上传凭据【只认 user.config.jsonc】。这里留空是刻意的。",
+    "apiToken": "",
+    "zoneId": "",
+    "records": []
+  },
+
+  "source": {
+    "_说明": "多个线上订阅合并去重后一起实测；全部失败才用本地缓存/快照。",
+    "urls": [
+      "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt",
+      "https://cf.junzhen.qzz.io/full_ips.txt",
+      "https://cf.junzhen.qzz.io/full_ips_bj.txt",
+      "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt"
+    ],
+    "merge": true,
+    "preferUrl": true,
+    "cacheFile": "var/cache/full_ips.txt",
+    "file": "",
+    "maxAgeMinutes": 0
+  },
+
+  "probe": {
+    "port": 443,
+    "bytes": 1048576,
+    "candidates": 150,
+    "rounds": 3,
+    "tcpPool": 0,
+    "tcpConcurrency": 40,
+    "tcpTimeoutMs": 1500,
+    "screenBytes": 262144,
+    "screenConcurrency": 5,
+    "screenTimeoutMs": 2500,
+    "downloadTimeoutMs": 6000,
+    "minMedianMbps": 1.0,
+    "minOkRate": 0.5
+  },
+
+  "fast": {
+    "_说明": "快速早停方案默认参数。常用项都在 user.config.jsonc 里有一份带注释的副本。",
+    "localBandwidthMbps": 0,
+    "targetMbps": 8,
+    "targetRatio": 0.6667,
+    "targetMaxMbps": 20,
+    "targetTtlDays": 30,
+    "floorMbps": 2,
+    "fallbackAfterProbes": 30,
+    "healthCheck": true,
+    "healthRounds": 2,
+    "targetCount": 10,
+    "minProbe": 60,
+    "uploadCount": 3,
+    "maxProbe": 80,
+    "probeConcurrency": 1,
+    "probeBytes": 1048576,
+    "probeTimeoutMs": 2500,
+    "verifyRounds": 2,
+    "qualityGuard": true,
+    "guardRatio": 0.5,
+    "maxSeconds": 300,
+    "bandwidthCacheFile": "var/cache/bandwidth.json",
+    "bandwidthCacheHours": 24,
+    "bandwidthSeconds": 4,
+    "historyFile": "var/cache/history.json",
+    "historyTtlHours": 12
+  },
+
+  "behavior": {
+    "dryRun": false,
+    "skipIfUnchanged": true,
+    "backupBeforeWrite": true,
+    "verifyDoh": true,
+    "logDir": "var/logs",
+    "backupDir": "var/backups",
+    "keepBackups": 3,
+    "keepLogs": 3,
+    "stateFile": "var/state.json",
+    "globalTimeoutMinutes": 15
+  }
+}

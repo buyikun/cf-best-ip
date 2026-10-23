@@ -1,0 +1,142 @@
+﻿/* ============================================================================
+ *  CF 优选 IP —— 配置文件【模板】（分享版，不含任何真实凭据）
+ * ----------------------------------------------------------------------------
+ *  ⚠️ 使用前请把本文件改名为：  user.config.jsonc
+ *     （Windows 资源管理器默认隐藏扩展名，改名时注意别变成
+ *       user.config.jsonc.txt —— 建议在"查看"里勾选"文件扩展名"）
+ *
+ *  改好名之后，填下面第一节的三样东西，然后双击 run-fast.cmd 即可。
+ *
+ *  ★ 不填也能跑 ★
+ *    只要 apiToken / zoneId / records 任意一项为空，程序就进入"演示模式"：
+ *    只测速、打印结果，绝不调用 Cloudflare 写接口，不会碰你的 DNS。
+ * ========================================================================== */
+{
+  /* ────────────────────────────────────────────────────────────────
+   *  一、Cloudflare 上传配置
+   * ──────────────────────────────────────────────────────────────── */
+  "cloudflare": {
+    /* API Token：dash.cloudflare.com → 右上角头像 → My Profile → API Tokens
+     *   → Create Token，权限选 Zone → DNS → Edit，
+     *   并限定到你要用的那个域名（最小权限，最安全）。
+     *   形如：cfut_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */
+    "apiToken": "",
+
+    /* Zone ID：dash.cloudflare.com 点进该域名 → 右下角 Overview 面板里的
+     *   Zone ID（32 位十六进制，注意不是 Account ID） */
+    "zoneId": "",
+
+    /* 要自动替换的 DNS 记录列表，可以加任意多条。
+     * 脚本会把测速选出的 IP 写成这些名字下的 A 记录。 */
+    "records": [
+      {
+        /* 改成你自己的子域名，例如 sub.你的域名.com（不要带 http:// 或结尾斜杠） */
+        "name": "sub1.example.com",
+        "type": "A",            /* 一般固定 "A"（IPv4） */
+        "ttl": 300,             /* 缓存秒数，300=5 分钟；填 1 表示 CF 的 Auto */
+        "proxied": false,       /* 是否开 CF 小云朵。优选 IP 必须 false */
+        "topN": 3,              /* 这条记录最多保留几个 IP */
+
+        /* 按国家码筛选节点：
+         *   mode="deny"  → 排除 tokens 里的国家
+         *   mode="allow" → 只保留 tokens 里的国家
+         *   tokens=[]    → 不筛选
+         * 国家码就是订阅里 # 后面那两位：JP=日本 HK=香港 US=美国 SG=新加坡 … */
+        "filter": { "mode": "deny", "tokens": ["JP"] }
+      },
+      {
+        "name": "sub2.example.com",
+        "type": "A",
+        "ttl": 300,
+        "proxied": false,
+        "topN": 3,
+        "filter": { "mode": "deny", "tokens": [] }
+      }
+    ]
+  },
+
+  /* ────────────────────────────────────────────────────────────────
+   *  二、IP 来源（默认 4 路订阅合并去重；也可换成你自己的订阅地址）
+   * ──────────────────────────────────────────────────────────────── */
+  "source": {
+    "urls": [
+      "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt",
+      "https://cf.junzhen.qzz.io/full_ips.txt",
+      "https://cf.junzhen.qzz.io/full_ips_bj.txt",
+      "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt"
+    ],
+    "merge": true,            /* true=合并所有源；false=只用第一个能拉到的 */
+    "preferUrl": true,        /* true=优先线上订阅，全失败才用本地缓存 */
+    "cacheFile": "cache/full_ips.txt",
+    "file": ""                /* 本地兜底文件路径，留空即可 */
+  },
+
+  /* ────────────────────────────────────────────────────────────────
+   *  三、快速模式（run-fast.cmd，日常用这个）
+   * ──────────────────────────────────────────────────────────────── */
+  "fast": {
+    /* ★「IP 可用」阈值(Mbps)：8 足够流畅看 1080p。
+     *   调高更挑但更换更频繁；填 0 则按你本地带宽自动校准。 */
+    "targetMbps": 8,
+    "targetRatio": 0.6667,    /* 自动模式：本地带宽 × 该比例 */
+    "targetMaxMbps": 20,      /* 自动模式的封顶值 */
+    "targetTtlDays": 30,      /* 校准值多少天后重测 */
+
+    /* 先体检 DNS 里正在用的 IP，达标就不折腾（多数情况几秒收工） */
+    "healthCheck": true,
+    "healthRounds": 2,        /* 每个 IP 测几次取最好；单次测速噪声很大，别改成 1 */
+
+    /* 凑够 targetCount 个达标节点、且至少测满 minProbe 个就停止探测 */
+    "targetCount": 10,
+    "minProbe": 60,
+    "uploadCount": 3,         /* 最终写入几个 IP */
+    "maxProbe": 80,
+    "maxSeconds": 300,
+
+    /* 探测参数 —— 并发务必保持 1：
+     * 并发测速会互抢带宽，实测能把 77Mbps 压成 8Mbps，排名完全失真 */
+    "probeConcurrency": 1,
+    "probeBytes": 1048576,
+    "probeTimeoutMs": 2500,
+
+    /* 本次比上次差太多就跳过写入，避免网络变差时越换越差 */
+    "qualityGuard": true,
+    "guardRatio": 0.5,
+
+    "historyFile": "cache/history.json",
+    "historyTtlHours": 12
+  },
+
+  /* ────────────────────────────────────────────────────────────────
+   *  四、全量模式（run-full.cmd，想挖最快节点时用，慢但更全面）
+   * ──────────────────────────────────────────────────────────────── */
+  "probe": {
+    "port": 443,              /* DNS 只能存 IP 不能存端口，统一用 443 实测 */
+    "bytes": 1048576,
+    "candidates": 150,        /* 粗筛节点数，调大更全面但更慢 */
+    "rounds": 3,              /* 正式测速轮数，取中位数 */
+    "tcpPool": 0,
+    "tcpConcurrency": 40,
+    "tcpTimeoutMs": 1500,
+    "screenBytes": 262144,
+    "screenConcurrency": 5,
+    "screenTimeoutMs": 2500,
+    "downloadTimeoutMs": 6000,
+    "minMedianMbps": 1.0,     /* 中位速度低于此值淘汰 */
+    "minOkRate": 0.5          /* 成功率低于此值淘汰 */
+  },
+
+  /* ────────────────────────────────────────────────────────────────
+   *  五、运行行为
+   * ──────────────────────────────────────────────────────────────── */
+  "behavior": {
+    "dryRun": false,          /* true = 全局只测速不上传 */
+    "skipIfUnchanged": true,  /* 目标与现状一致时跳过写入 */
+    "backupBeforeWrite": true,/* 写入前备份整份 DNS 记录 */
+    "verifyDoh": true,        /* 写后用公共 DoH 复查解析 */
+    "keepBackups": 3,         /* backups\ 只留最近几份 */
+    "keepLogs": 3,            /* logs\ 只留最近几次 */
+    "globalTimeoutMinutes": 15,
+    "verbose": false
+  }
+}

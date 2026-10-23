@@ -1,0 +1,9 @@
+# 行尾策略：Windows 批处理必须是 CRLF，否则 cmd.exe 解析异常
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+# 源码与文档统一用 LF，避免跨平台 diff 噪音
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.jsonc text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
