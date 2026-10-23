@@ -67,22 +67,22 @@
 
 桌面上的「CF优选-快速模式」「CF优选-全量模式」随时可以用这个脚本重建（换电脑、误删、想改名都用它）：
 
-- **双击 `添加桌面快捷方式.cmd`** —— 最省事，跑完会暂停让你看结果
-- 或者用命令（在 `D:\ai\cfip-work` 目录下执行）：
+- **双击 `make-desktop-shortcuts.cmd`** —— 最省事，跑完会暂停让你看结果
+- 或者用命令（**在本文件夹根目录下执行**）：
 
   ```powershell
   # 创建两个桌面快捷方式
-  powershell -NoProfile -ExecutionPolicy Bypass -File make-desktop-shortcuts.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File src\make-desktop-shortcuts.ps1
 
   # 删除桌面快捷方式
-  powershell -NoProfile -ExecutionPolicy Bypass -File make-desktop-shortcuts.ps1 -Remove
+  powershell -NoProfile -ExecutionPolicy Bypass -File src\make-desktop-shortcuts.ps1 -Remove
 
   # 自定义快捷方式名字前缀（默认 CF优选）
-  powershell -NoProfile -ExecutionPolicy Bypass -File make-desktop-shortcuts.ps1 -Prefix "优选"
+  powershell -NoProfile -ExecutionPolicy Bypass -File src\make-desktop-shortcuts.ps1 -Prefix "优选"
   ```
 
-脚本细节：桌面路径自动探测（兼容 OneDrive 重定向的桌面）、快捷方式的**工作目录锁定为本文件夹**
-（保证日志/缓存/备份都落在 `D:\ai\cfip-work\`）、不需要管理员权限，创建前会检查目标文件是否存在。
+脚本细节：桌面路径自动探测（兼容 OneDrive 重定向的桌面）、快捷方式的**工作目录锁定为本文件夹所在目录**
+（保证日志/缓存/备份都落在本文件夹里）、不需要管理员权限，创建前会检查目标文件是否存在。
 
 ## 拷给别人用（不需要任何额外步骤）
 
@@ -96,7 +96,7 @@
 
 ⚠️ **发出去之前务必清空你自己的凭据**：把 `user.config.jsonc` 里的 `apiToken`、`zoneId` 清空
 （`records` 改成 `example.com` 之类的占位值），或者干脆删掉这个文件（程序会自动走演示模式）。
-`logs\`、`backups\`、`cache\`、`state.json` 里可能含有你的域名和 IP 记录，也建议一并删掉再打包。
+`var\` 目录里可能含有你的域名和 IP 记录，也建议一并删掉再打包。
 
 对方拿到后的三步：**装 Node.js → 填 `user.config.jsonc` → 双击 `run-fast.cmd`**。
 
@@ -132,10 +132,10 @@
 | `make-desktop-shortcuts.ps1` | 在桌面创建/删除一键运行快捷方式（支持 `-Remove`、`-Prefix`） |
 | `make-desktop-shortcuts.cmd` | 上面那个脚本的双击入口 |
 | `cf-api.mjs` | 手工运维小工具：`node cf-api.mjs list` 列记录 / `set <域名> <ip,ip,...>` 指定记录 |
-| `logs/latest.log` | 最近一次运行日志（只保留最近 3 次 + latest） |
-| `backups/` | 每次写入前的完整 DNS 记录备份（只保留最近 3 份，可回滚） |
-| `cache/` | 订阅缓存、探测历史、各网络的带宽/阈值档案 |
-| `state.json` | 最近一次运行结果快照 |
+| `var/logs/latest.log` | 最近一次运行日志（只保留最近 3 次 + latest） |
+| `var/backups/` | 每次写入前的完整 DNS 记录备份（只保留最近 3 份，可回滚） |
+| `var/cache/` | 订阅缓存、探测历史、各网络的带宽/阈值档案 |
+| `var/state.json` | 最近一次运行结果快照 |
 
 ---
 
@@ -143,12 +143,12 @@
 
 目标：**快速模式下要的是「可用」，不是「最好」**——最好交给全量方案。
 
-0. **网络指纹**：`出口 IP 段 + ASN`（例如 `AS36352|23.94`）。
+0. **网络指纹**：`出口 IP 段 + ASN`（例如 `AS12345|1.2`，具体值因网络而异）。
    换 WiFi / 换运营商会变成新指纹 → 自动重新校准阈值；网络换回去时，直接复用之前存的档案。
 1. **达标线（IP 可用参考值）**：默认 `targetMbps: 8`。
    依据：实测多数 CF 节点落在 5-13Mbps，8Mbps 足够流畅 1080p；调高会更挑、但重新优选频率也上升。
    也可以设 `targetMbps: 0` 切到自动模式：`本地带宽 × targetRatio`（封顶 `targetMaxMbps`），
-   结果按网络指纹存进 `cache/bandwidth.json` 档案，**下次同网络直接复用**，`targetTtlDays`（默认 30 天）后重新校准。
+   结果按网络指纹存进 `var/cache/bandwidth.json` 档案，**下次同网络直接复用**，`targetTtlDays`（默认 30 天）后重新校准。
 2. **现状体检（最省事的一步）**：直接解析 DNS 里正在用的 IP，每个测 `healthRounds`（默认 2）次取最好值
    （单次测量噪声极大：同一个 IP 有时 0Mbps、有时 300Mbps，必须多测）。
    **只要有 `uploadCount`（3）个仍达标 → 立即收工，完全不重新优选**，实测这种情形全程 **7 秒**。
@@ -157,16 +157,17 @@
 4. **优中选优**：入围节点复核 `verifyRounds`（2）轮取中位数，最终取最快 `uploadCount`（3）个写入 Cloudflare。
 5. **质量保护**：本次最佳 < 上次运行最佳 × `guardRatio`（默认 0.5）时跳过写入，网络变差时不让它越换越差。
 
-## 定时巡检（DSH 自动化任务）
+## 定时自动运行
 
-已注册 DSH 定时任务，**每晚 19:00-23:00 每小时**跑一次（大陆 CF 使用高峰期，cron `0 19-23 * * *`，Asia/Shanghai）：
+本项目本身不带调度器，用系统自带的计划任务即可。以 Windows「任务计划程序」为例：
 
-- 任务 ID：`schedule-bccb34a0-69ad-460a-ba12-117279bf5b1e`
-- 名称：CF优选IP高峰期巡检
-- 多数情况下走「现状体检」分支，几秒结束；不达标才做完整优选（2-5 分钟）
+- **程序**：`<本文件夹>\src\cfip-fast.mjs`（用 `node` 执行）
+- **起始于**：本文件夹根目录
+- **建议时间**：大陆上网高峰时段（19:00-23:00），这样选出的 IP 在高峰期也好用
 
-> 注意：改这个任务请**删除后重建**，不要用 `schedule_update`——实测它会把 cron 表达式写坏成"每周某天"。
-> 该任务依赖 DSH 在运行；DSH 关闭期间不会触发。
+多数情况下运行会走「现状体检」分支，几秒就结束；只有 IP 不达标时才做完整优选（2-5 分钟）。
+
+> 提示：不要用 `--force`，否则每次都会重写 DNS 记录，失去"无变化跳过"的保护。
 
 ## 全量方案流程
 
@@ -188,7 +189,7 @@ cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt        ← jsDelivr 镜�
 
 > ⚠️ 实测这些上游数据本身较旧（GitHub 主源最后提交 2026-09-07），标称高速的节点大面积失效。
 > 所以两种方案都**不信任标称值**，一律本地重测；每轮还会查 GitHub commit 时间，超过 6 小时打印过期告警。
-> 线上全部拉不到时回退 `cache/full_ips.txt`，再不行才用本地快照。
+> 线上全部拉不到时回退 `var/cache/full_ips.txt`，再不行才用本地快照。
 
 ## 关键参数速查（cfip.config.json）
 
