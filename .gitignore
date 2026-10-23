@@ -15,6 +15,3 @@ _tmp*
 Thumbs.db
 desktop.ini
 .DS_Store
-
-# 开发者私人笔记（不进仓库）
-DEVELOPMENT.md
