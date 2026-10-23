@@ -56,7 +56,7 @@
       run-cfip.cmd          ← 命令行入口，可加参数
       make-desktop-shortcuts.cmd  ← 建桌面图标
       user.config.jsonc     ← 你的配置（由 .example 改名而来）
-      README-FIRST.txt / README-AUTO.md  ← 说明文档
+      README-FIRST.txt / README.md  ← 说明文档
 
   程序文件都在 src\ 里，不用管它：
       cfip-fast.mjs / cfip-auto.mjs / cfip-lib.mjs / cf-api.mjs
@@ -83,4 +83,4 @@
   · 为什么运行后根目录没变多文件
       所有运行日志与备份都写进 var\ 了，根目录保持整洁。
 
-更完整的技术说明（两种方案的原理、全部参数、退出码）见 README-AUTO.md
+更完整的技术说明（两种方案的原理、全部参数、退出码）见 README.md
