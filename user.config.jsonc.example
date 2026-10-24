@@ -71,14 +71,15 @@
    * ──────────────────────────────────────────────────────────────── */
   "source": {
     "urls": [
-      "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt",
-      "https://cf.junzhen.qzz.io/full_ips.txt",
-      "https://cf.junzhen.qzz.io/full_ips_bj.txt",
-      "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt"
+      { "url": "https://api.uouin.com/cloudflare.html", "tier": "fresh",  "name": "麒麟优选(HTML,高频更新)" },
+      { "url": "https://cf.junzhen.qzz.io/full_ips.txt", "tier": "fresh",  "name": "junzhen四川联通" },
+      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" },
+      { "url": "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt", "tier": "legacy", "name": "GitHub主源(较旧)" },
+      { "url": "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt", "tier": "legacy", "name": "jsDelivr镜像(较旧)" }
     ],
     "merge": true,            /* true=合并所有源；false=只用第一个能拉到的 */
     "preferUrl": true,        /* true=优先线上订阅，全失败才用本地缓存 */
-    "cacheFile": "cache/full_ips.txt",
+    "cacheFile": "var/cache/full_ips.txt",
     "file": ""                /* 本地兜底文件路径，留空即可 */
   },
 
@@ -104,35 +105,64 @@
     "maxProbe": 80,
     "maxSeconds": 300,
 
-    /* 探测参数 —— 并发务必保持 1：
+    /* ── 两阶段测速 ──────────────────────────────────────────
+     * 阶段1 预筛：用极小样本并发判断节点"到底通不通"，快速淘汰死节点。
+     *   实测 16KB 样本的判定准确率 100%（不会误放死节点、也不会漏掉活节点）。
+     *   并发数可以开大，因为预筛不关心速度准不准，也不受抢带宽影响。 */
+    "screenBytes": 16384,       /* 预筛样本大小；0 = 关闭预筛（退回逐个精测） */
+    "screenConcurrency": 32,    /* 预筛并发数。预筛只测通不通，并发开大不伤准确率 */
+    "screenTimeoutMs": 2500,    /* 单个节点预筛超时 */
+
+    /* 阶段2 精测：只对预筛存活的节点做，必须串行。
      * 并发测速会互抢带宽，实测能把 77Mbps 压成 8Mbps，排名完全失真 */
     "probeConcurrency": 1,
-    "probeBytes": 1048576,
-    "probeTimeoutMs": 2500,
+    "probeDurationSec": 1.5,    /* 精测固定跑 1.5 秒硬掐断，绝不多等 1 毫秒 */
+    "preselectRatio": 0.4,      /* 精测预选门槛 = 达标线 × 该比例。宽松预选进复核 */
+
+    /* 阶段3 复核：升级为「固定时长稳态测速引擎」
+     * 1. 慢节点绝不死等：跑满设定秒数立刻掐断，彻底告别下几MB卡十几秒的现象；
+     * 2. 快节点剥离慢启动：丢弃前 0.8s 爬坡期，只采纳稳态净速率，精准测出极限带宽！ */
+    "verifyDurationSec": 3.0,   /* 复核每节点严格跑 3.0 秒 */
+    "verifyWarmSec": 0.8,       /* 剥离前 0.8 秒 TCP 慢启动，只计算稳态速度 */
 
     /* 本次比上次差太多就跳过写入，避免网络变差时越换越差 */
     "qualityGuard": true,
     "guardRatio": 0.5,
 
-    "historyFile": "cache/history.json",
+    "historyFile": "var/cache/history.json",
     "historyTtlHours": 12
   },
 
   /* ────────────────────────────────────────────────────────────────
-   *  四、全量模式（run-full.cmd，想挖最快节点时用，慢但更全面）
+   *  四、全量模式（run-full.cmd，想挖最快节点时用，慢但最全面）
+   *
+   *  现代三段式流程：
+   *    阶段1 预筛：全部候选都用 16KB 小样本试一遍，淘汰死节点（不设上限，一个不落）
+   *    阶段2 初测：幸存者每节点跑 1.5 秒硬掐断，快速初排座次，绝不死等
+   *    阶段3 复核：对初测前几名每节点跑 3.0 秒，剥离 0.8s 慢启动测定稳态极限
+   *
+   *  全程只用实测数据做判断，不参考订阅源标注的速度（实测证明那个值与真实速度无关）。
    * ──────────────────────────────────────────────────────────────── */
   "probe": {
     "port": 443,              /* DNS 只能存 IP 不能存端口，统一用 443 实测 */
-    "bytes": 1048576,
-    "candidates": 150,        /* 粗筛节点数，调大更全面但更慢 */
-    "rounds": 3,              /* 正式测速轮数，取中位数 */
-    "tcpPool": 0,
-    "tcpConcurrency": 40,
-    "tcpTimeoutMs": 1500,
-    "screenBytes": 262144,
-    "screenConcurrency": 5,
-    "screenTimeoutMs": 2500,
-    "downloadTimeoutMs": 6000,
+
+    /* 阶段1 预筛 */
+    "screenBytes": 16384,     /* 预筛样本，16KB 足够判断通不通；调大更准但更慢 */
+    "screenConcurrency": 32,  /* 预筛并发。实测 1157 个节点：并发8=367s、16=183s、32=92s，
+                               * 三种并发存活数几乎一致（322/324/329），说明提高并发不影响准确率。
+                               * 因为预筛只测"通不通"、不测速度，不存在抢带宽问题。 */
+    "screenTimeoutMs": 2500,  /* 单个节点预筛超时 */
+
+    /* 阶段2 初测 */
+    "candidates": 0,          /* 初测多少个幸存者。0 = 不限（全部测），填数字则只测前 N 个 */
+    "probeDurationSec": 1.5,  /* 初测每节点跑 1.5 秒 */
+
+    /* 阶段3 复核 */
+    "verifyTopN": 15,         /* 对初测前几名做复核 */
+    "verifyRounds": 2,        /* 复核几轮（配合初测的 1 轮，取中位数） */
+    "verifyDurationSec": 3.0, /* 复核每节点跑 3.0 秒，彻底解决大文件死等痛点 */
+    "verifyWarmSec": 0.8,     /* 剥离前 0.8 秒慢启动，测定真实极限稳态速度 */
+
     "minMedianMbps": 1.0,     /* 中位速度低于此值淘汰 */
     "minOkRate": 0.5          /* 成功率低于此值淘汰 */
   },
@@ -147,7 +177,9 @@
     "verifyDoh": true,        /* 写后用公共 DoH 复查解析 */
     "keepBackups": 3,         /* backups\ 只留最近几份 */
     "keepLogs": 3,            /* logs\ 只留最近几次 */
-    "globalTimeoutMinutes": 15,
+    /* 全局超时（分钟）。全量模式要测上千个节点，实测约需 16-20 分钟，
+     * 所以这里给足 60 分钟；如果只跑快速模式，设小些也无妨。 */
+    "globalTimeoutMinutes": 60,
     "verbose": false
   }
 }

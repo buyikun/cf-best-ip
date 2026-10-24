@@ -17,7 +17,7 @@ import path from 'node:path';
 import net from 'node:net';
 import https from 'node:https';
 import { fileURLToPath } from 'node:url';
-import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib } from './cfip-lib.mjs';
+import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib, quickProbe, download, downloadTimed, pool, median } from './cfip-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = findBaseDir(HERE);   // 根目录（配置与 var\ 所在层），程序可放在 src\ 子目录
@@ -59,7 +59,7 @@ function flushLog() {
 process.on('exit', flushLog);
 let hardTimeout = null;
 function armGlobalTimeout() {
-  const minutes = Number(cfg.behavior.globalTimeoutMinutes || 15);
+  const minutes = Number(cfg.behavior.globalTimeoutMinutes || 60);
   hardTimeout = setTimeout(() => {
     log(`!! 触发全局超时(${minutes} 分钟)，放弃本次写入并退出`);
     process.exitCode = 2;
@@ -136,64 +136,6 @@ async function noteFreshness(url) {
 async function loadSource() {
   return loadSourceLib(cfg.source, CFG_DIR, log);
 }
-
-// ── 探针 ──────────────────────────────────────────────────────────
-function tcpProbe(ip, port, timeout) {
-  return new Promise(resolve => {
-    const t0 = Date.now();
-    const sock = net.connect({ host: ip, port });
-    let done = false;
-    const fin = (ok, err) => {
-      if (done) return; done = true;
-      try { sock.destroy(); } catch {}
-      resolve({ ok, tcpMs: Date.now() - t0, err: err || '' });
-    };
-    sock.setTimeout(timeout, () => fin(false, 'tcp-timeout'));
-    sock.on('connect', () => fin(true));
-    sock.on('error', e => fin(false, e.code || e.message));
-  });
-}
-
-function download(ip, port, bytes, timeout) {
-  return new Promise(resolve => {
-    const t0 = Date.now();
-    let ttfb = 0, got = 0, done = false;
-    let guard = null;
-    const fin = (ok, err) => {
-      if (done) return; done = true;
-      if (guard) clearTimeout(guard);
-      try { req && req.destroy(); } catch { /* 忽略 */ }
-      const total = Date.now() - t0;
-      const mbps = ok && total - ttfb > 0 ? (got * 8) / ((total - ttfb) / 1000) / 1e6 : 0;
-      resolve({ ok, mbps: +mbps.toFixed(2), ttfb: ok ? ttfb : 0, total, err: err || '' });
-    };
-    const req = https.request({
-      host: ip, port, path: `/__down?bytes=${bytes}`, method: 'GET',
-      servername: 'speed.cloudflare.com', rejectUnauthorized: false,
-      headers: { Host: 'speed.cloudflare.com', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/152.0' }
-    }, res => {
-      if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
-      res.on('data', c => { if (!ttfb) ttfb = Date.now() - t0; got += c.length; });
-      res.on('end', () => fin(true));
-      res.on('error', e => fin(false, e.code || e.message));
-    });
-    // socket 空闲超时 + 无论如何都会 resolve 的硬兜底，避免个别连接把整轮任务卡死
-    req.setTimeout(timeout, () => req.destroy(new Error('dl-timeout')));
-    guard = setTimeout(() => fin(false, 'guard-timeout'), timeout + 2500);
-    req.on('error', e => fin(false, e.code || e.message));
-    req.end();
-  });
-}
-
-async function pool(items, limit, worker) {
-  let i = 0;
-  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-    while (i < items.length) { const item = items[i++]; await worker(item); }
-  });
-  await Promise.all(runners);
-}
-
-const median = a => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 
 // ── Cloudflare API ────────────────────────────────────────────────
 const API = 'https://api.cloudflare.com/client/v4';
@@ -281,59 +223,104 @@ try {
 
   // 1. 源
   const all = await loadSource();
-  log(`源记录：${all.length} 条，其中带速度标注 ${all.filter(r => r.fileMbps > 0).length} 条`);
+  log(`源记录：${all.length} 条`);
   if (!all.length) throw new Error('源文件没有可解析的 IP');
 
-  // 2. 候选：TCP 门控很便宜，可以对尽可能多的节点做；下载测速贵，才需要限量
+  // 2. 候选池：去重后全部纳入，不做任何优先级排序
+  //    全量模式的目标是「挖最快节点」，实测才是唯一依据。
+  //    订阅源标注的速度与实测毫无相关性（标称 10.27M 的实测失败、
+  //    标称 4.09M 的实测 5.56M），源的新旧/评分只代表历史，不影响本轮结果。
+  //    排序只会改变测试先后，不改变最终排名，所以干脆不排序。
   const P = Number(cfg.probe.port);
-  const byMbps = (a, b) => (b.fileMbps - a.fileMbps) || (a.fileMs - b.fileMs);
-  const t1 = all.filter(r => r.port === P && r.fileMbps > 0).sort(byMbps);
-  const t2 = all.filter(r => r.port === P && r.fileMbps === 0);
-  const t3 = all.filter(r => r.port !== P && r.fileMbps > 0).sort(byMbps);
-  const gateLimit = Number(cfg.probe.tcpPool || 0) || Infinity;
-  const gatePool = [...t1, ...t2, ...t3].slice(0, gateLimit).map(r => ({ ...r, port: P }));
-  log(`候选池：${P} 端口+有速度 ${t1.length} / ${P} 端口+无速度 ${t2.length} / 其他端口 ${t3.length}；本轮门控 ${gatePool.length} 个`);
+  const gatePool = all.map(r => ({ ...r, port: P }));
+  log(`候选池：共 ${gatePool.length} 个（全部纳入，不排序、不截断）`);
 
-  // 3. TCP 门控
-  const alive = [];
-  await pool(gatePool, cfg.probe.tcpConcurrency, async c => {
-    const t = await tcpProbe(c.ip, c.port, cfg.probe.tcpTimeoutMs);
-    if (t.ok) alive.push({ ...c, tcpMs: t.tcpMs });
-    else if (VERBOSE) log(`   x ${c.ip} TCP 不通(${t.err})`);
-  });
-  log(`TCP ${P} 可达：${alive.length}/${gatePool.length}`);
-  if (!alive.length) throw new Error('没有候选 IP 能连通，放弃本次任务');
+  // 3. 并发预筛（16KB 小样本）—— 全量模式不做任何上限，全部节点都筛
+  //    注意：这里不做 TCP 门控——实测在 TUN 代理环境下 TCP 握手会被本地接管，
+  //    死节点也显示"可达"（实测 1038/1038 全通），没有筛选价值。
+  //    改用 HTTP 小样本，能穿透代理触及真实节点，判定准确率实测 100%。
+  //    并发实测：1157 个节点，并发8=367s / 并发16=183s / 并发32=92s，
+  //    且三种并发的存活数几乎一致（322/324/329），说明提高并发不影响判定准确率
+  //    （预筛只看通不通，不测速度，所以不存在抢带宽问题）。
+  const screenBytes = Number(cfg.probe.screenBytes ?? 16384);
+  const screenConc = Math.max(1, Number(cfg.probe.screenConcurrency ?? 32));
+  const screenTimeout = Number(cfg.probe.screenTimeoutMs ?? 2500);
+  const screenPool = gatePool;   // 全量：不设上限，一个都不跳过
+  log(`---- 阶段1/3：并发预筛 ${screenPool.length} 个（${(screenBytes / 1024).toFixed(0)}KB 样本，并发 ${screenConc}）----`);
+  log('   正在并发连接各节点，结果会逐个出现…');
 
-  // 4. HTTP 粗筛（并发、小样本、短超时）：上游数据陈旧时大量节点已失效，先便宜地筛掉
-  const testList = alive.sort(byMbps).slice(0, cfg.probe.candidates);
-  if (testList.length < alive.length) log(`存活 ${alive.length} 个，取标称速度最高的 ${testList.length} 个进入 HTTP 粗筛`);
-  const screened = [];
-  await pool(testList, cfg.probe.screenConcurrency ?? 4, async c => {
-    const d = await download(c.ip, c.port, cfg.probe.screenBytes ?? 262144, cfg.probe.screenTimeoutMs ?? 3000);
-    if (d.ok) screened.push(c);
-    else if (VERBOSE) log(`   x ${c.ip} 粗筛失败(${d.err})`);
+  const survivors = [];
+  const tS = Date.now();
+  let doneCnt = 0;
+  await pool(screenPool, screenConc, async c => {
+    const r = await quickProbe(c.ip, c.port, screenBytes, screenTimeout);
+    doneCnt++;
+    if (r.ok) {
+      survivors.push(c);
+      if (VERBOSE) log(`   [${doneCnt}/${screenPool.length}] OK ${c.ip} (${r.ms}ms)`);
+    } else if (VERBOSE) {
+      log(`   [${doneCnt}/${screenPool.length}] X  ${c.ip} (${r.err})`);
+    }
+    if (doneCnt % 25 === 0 || doneCnt === screenPool.length) {
+      log(`   预筛进度 ${doneCnt}/${screenPool.length}，存活 ${survivors.length} 个`);
+    }
   });
-  log(`HTTP 粗筛通过：${screened.length}/${testList.length}`);
-  if (!screened.length) {
+  const screenSec = ((Date.now() - tS) / 1000).toFixed(1);
+  const killPct = screenPool.length ? ((1 - survivors.length / screenPool.length) * 100).toFixed(0) : 0;
+  log(`预筛完成：${survivors.length}/${screenPool.length} 存活（淘汰 ${killPct}%），耗时 ${screenSec}s`);
+  if (!survivors.length) {
     throw new Error(
-      `HTTP 粗筛 ${testList.length} 个节点全部失败，现有 DNS 记录保持不变。\n`
+      `预筛 ${screenPool.length} 个节点全部失败，现有 DNS 记录保持不变。\n`
       + `     排查建议：\n`
       + `       1) 数据源可能整体失效（查日志里"上游已 N 小时未更新"的告警）\n`
       + `       2) 网络异常，试试浏览器能否打开 https://speed.cloudflare.com\n`
-      + `       3) 若手动调小了 --candidates，请恢复默认（默认 150，太小容易全挂）`
+      + `       3) 检查 probe.screenBytes/screenTimeoutMs 是否被调得过于苛刻`
     );
   }
 
-  // 5. 多轮正式测速（串行，避免互抢带宽导致排名失真）
-  const rounds = Math.max(1, cfg.probe.rounds);
-  for (let r = 1; r <= rounds; r++) {
-    for (const c of screened) {
-      const d = await download(c.ip, c.port, cfg.probe.bytes, cfg.probe.downloadTimeoutMs);
-      (c.samples ||= []).push(d);
-      if (VERBOSE) log(`   r${r} ${c.ip} ${d.ok ? d.mbps + 'Mbps/' + d.ttfb + 'ms' : 'FAIL(' + d.err + ')'}`);
-    }
-    log(`第 ${r}/${rounds} 轮实测完成`);
+  // 4. 阶段2：全部幸存者各初测 1 轮（每节点固定跑 1.5 秒，快速筛出有希望的）
+  //    理由：幸存者里绝大多数要么失败、要么速度远不够，各跑 1.5 秒立即硬掐断，绝不多等。
+  const capN = Number(cfg.probe.candidates ?? 0);
+  const testList = capN > 0 ? survivors.slice(0, capN) : survivors;   // 0 = 不限制，全部测
+  log(`---- 阶段2/3：初测 ${testList.length} 个幸存者（每节点严格跑 1.5 秒硬掐断，绝不死等）----`);
+
+  let initIdx = 0;
+  for (const c of testList) {
+    initIdx++;
+    const d = await downloadTimed(c.ip, c.port, 1.5, 0.4, p => {
+      log(`   初测 [${initIdx}/${testList.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
+    });
+    (c.samples ||= []).push(d);
   }
+  log(`初测完成：${testList.length} 个`);
+
+  // 5. 阶段3：对初测排名靠前的再复核若干轮（固定跑 3.0 秒，剥离 0.8s 慢启动求稳态极限）
+  const verifyTop = Math.max(1, Number(cfg.probe.verifyTopN ?? 15));
+  const verifyRounds = Math.max(0, Number(cfg.probe.verifyRounds ?? 2));
+  const prelim = testList.map(c => {
+    const ok = c.samples.filter(s => s.ok);
+    return { ...c, mbps: median(ok.map(s => s.mbps)), ttfb: median(ok.map(s => s.ttfb)), okRate: ok.length / c.samples.length };
+  }).filter(r => r.okRate >= cfg.probe.minOkRate && r.mbps >= cfg.probe.minMedianMbps)
+    .sort((a, b) => (b.mbps - a.mbps) || (a.ttfb - b.ttfb));
+
+  log(`初测合格：${prelim.length} 个（要求 ok率≥${cfg.probe.minOkRate}，速度≥${cfg.probe.minMedianMbps}Mbps）`);
+  if (prelim.length && verifyRounds > 0) {
+    const verifyList = prelim.slice(0, verifyTop);
+    log(`---- 阶段3/3：复核前 ${verifyList.length} 名 × ${verifyRounds} 轮（每轮跑 3.0 秒求稳态极限，剥离慢启动）----`);
+    for (let r = 1; r <= verifyRounds; r++) {
+      let j = 0;
+      for (const c of verifyList) {
+        j++;
+        const d = await downloadTimed(c.ip, c.port, 3.0, 0.8, p => {
+          log(`   复核 第${r}轮 [${j}/${verifyList.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
+        });
+        (c.samples ||= []).push(d);
+      }
+      log(`复核第 ${r}/${verifyRounds} 轮完成`);
+    }
+  }
+
+  const screened = testList;
 
   // 6. 中位数排名
   const ranked = screened.map(c => {

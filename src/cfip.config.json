@@ -26,16 +26,15 @@
 
   "probe": {
     "port": 443,
-    "bytes": 1048576,
-    "candidates": 150,
-    "rounds": 3,
-    "tcpPool": 0,
-    "tcpConcurrency": 40,
-    "tcpTimeoutMs": 1500,
-    "screenBytes": 262144,
-    "screenConcurrency": 5,
+    "candidates": 0,
+    "verifyTopN": 15,
+    "verifyRounds": 2,
+    "probeDurationSec": 1.5,
+    "verifyDurationSec": 3.0,
+    "verifyWarmSec": 0.8,
+    "screenBytes": 16384,
+    "screenConcurrency": 32,
     "screenTimeoutMs": 2500,
-    "downloadTimeoutMs": 6000,
     "minMedianMbps": 1.0,
     "minOkRate": 0.5
   },
@@ -55,9 +54,16 @@
     "minProbe": 60,
     "uploadCount": 3,
     "maxProbe": 80,
+    "screenBytes": 16384,
+    "screenConcurrency": 32,
+    "screenTimeoutMs": 2500,
     "probeConcurrency": 1,
-    "probeBytes": 1048576,
-    "probeTimeoutMs": 2500,
+    "probeDurationSec": 1.5,
+    "preselectRatio": 0.4,
+    "healthDurationSec": 2.5,
+    "healthWarmSec": 0.8,
+    "verifyDurationSec": 3.0,
+    "verifyWarmSec": 0.8,
     "verifyRounds": 2,
     "qualityGuard": true,
     "guardRatio": 0.5,
@@ -79,6 +85,6 @@
     "keepBackups": 3,
     "keepLogs": 3,
     "stateFile": "var/state.json",
-    "globalTimeoutMinutes": 15
+    "globalTimeoutMinutes": 60
   }
 }

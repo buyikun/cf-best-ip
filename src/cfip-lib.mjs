@@ -229,10 +229,11 @@ export function tcpProbe(ip, port, timeout = 1500) {
   });
 }
 
-export function download(ip, port, bytes, timeout) {
+export function download(ip, port, bytes, timeout, onProgress) {
   return new Promise(resolve => {
     const t0 = Date.now();
     let ttfb = 0, got = 0, done = false, guard = null;
+    let lastTick = 0;
     const fin = (ok, err) => {
       if (done) return; done = true;
       if (guard) clearTimeout(guard);
@@ -246,13 +247,188 @@ export function download(ip, port, bytes, timeout) {
       servername: 'speed.cloudflare.com', rejectUnauthorized: false,
       headers: { Host: 'speed.cloudflare.com', 'User-Agent': UA }
     }, res => {
+      // 1. 状态码必须是 200
       if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
-      res.on('data', c => { if (!ttfb) ttfb = Date.now() - t0; got += c.length; });
-      res.on('end', () => fin(true));
+
+      // 2. 严查是否为真实的 Cloudflare 边缘节点，过滤伪装/默认网页主机（如只返回几KB html 却算成上百Mbps的假节点）
+      const server = String(res.headers['server'] || '').toLowerCase();
+      const hasCfRay = !!res.headers['cf-ray'];
+      const cType = String(res.headers['content-type'] || '').toLowerCase();
+      if (!server.includes('cloudflare') && !hasCfRay) {
+        res.resume();
+        return fin(false, '非CF节点(Server:' + (server || 'none') + ')');
+      }
+      if (cType.includes('text/html')) {
+        res.resume();
+        return fin(false, '返回HTML非测速流');
+      }
+
+      res.on('data', c => {
+        if (!ttfb) ttfb = Date.now() - t0;
+        got += c.length;
+        // 每 700ms 回调一次进度，让调用方能实时显示"已下载 xx%"，避免界面看起来卡住
+        if (onProgress && Date.now() - lastTick >= 700) {
+          lastTick = Date.now();
+          const el = (Date.now() - t0) / 1000;          // 用总耗时算瞬时速度
+          const cur = el > 0 ? (got * 8) / el / 1e6 : 0;
+          try { onProgress({ got, bytes, pct: Math.min(100, Math.round(got / bytes * 100)), mbps: +cur.toFixed(1) }); } catch { /* 忽略 */ }
+        }
+      });
+      res.on('end', () => {
+        // 3. 校验接收字节数是否完整（至少达到请求字节数的 85%，防止对端提前截断造成虚假超高速）
+        if (got < bytes * 0.85) {
+          return fin(false, '数据截断(' + got + '/' + bytes + ')');
+        }
+        fin(true);
+      });
       res.on('error', e => fin(false, e.code || e.message));
     });
     req.setTimeout(timeout, () => req.destroy(new Error('dl-timeout')));
     guard = setTimeout(() => fin(false, 'guard-timeout'), timeout + 2500);
+    req.on('error', e => fin(false, e.code || e.message));
+    req.end();
+  });
+}
+
+/**
+ * 现代稳态测速引擎：固定时长测速（Duration-based），并剥离 TCP 慢启动
+ * 
+ * 优势：
+ * 1. 慢节点绝不死等：到达 duration 秒强制斩断，绝不卡死界面
+ * 2. 快节点拉满极速：给足时间爬坡，丢弃前 warmSeconds 秒慢启动，测出真实的稳态极限带宽
+ */
+export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8, onProgress = null) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    let ttfb = 0, got = 0, done = false, timer = null, guardTimer = null;
+    const timeline = [];
+
+    const fin = (ok, err = '') => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      if (guardTimer) clearTimeout(guardTimer);
+      try { req && req.destroy(); } catch {}
+
+      const totalMs = Date.now() - t0;
+      if (!ok) {
+        return resolve({ ok: false, err: err || 'failed', totalMs, ttfb, mbps: 0, steadyMbps: 0, got });
+      }
+
+      // 剥离慢启动，计算稳态净速率
+      const warmMs = warmSeconds * 1000;
+      let basePoint = null;
+      for (const pt of timeline) {
+        if (pt.t >= warmMs) { basePoint = pt; break; }
+      }
+      const endPoint = timeline[timeline.length - 1] || { t: totalMs - ttfb, got };
+      let steadyMbps = 0;
+      if (basePoint && endPoint.t > basePoint.t) {
+        const deltaBytes = endPoint.got - basePoint.got;
+        const deltaSec = (endPoint.t - basePoint.t) / 1000;
+        steadyMbps = deltaSec > 0 ? (deltaBytes * 8) / deltaSec / 1e6 : 0;
+      } else {
+        const netSec = (totalMs - ttfb) / 1000;
+        steadyMbps = netSec > 0 ? (got * 8) / netSec / 1e6 : 0;
+      }
+      const netSecTotal = (totalMs - ttfb) / 1000;
+      const overallMbps = netSecTotal > 0 ? (got * 8) / netSecTotal / 1e6 : 0;
+
+      resolve({
+        ok: true,
+        err: '',
+        totalMs,
+        ttfb,
+        got,
+        mbps: +steadyMbps.toFixed(2),       // 默认对外暴露的值即为稳态速度
+        overallMbps: +overallMbps.toFixed(2),
+        steadyMbps: +steadyMbps.toFixed(2),
+        duration: +netSecTotal.toFixed(2)
+      });
+    };
+
+    // CF 官方接口单次最大允许 50MB (52428800)
+    const bigBytes = 52428800;
+    const req = https.request({
+      host: ip, port, path: `/__down?bytes=${bigBytes}`, method: 'GET',
+      servername: 'speed.cloudflare.com', rejectUnauthorized: false,
+      headers: { Host: 'speed.cloudflare.com', 'User-Agent': UA }
+    }, res => {
+      if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
+      const server = String(res.headers['server'] || '').toLowerCase();
+      const hasCfRay = !!res.headers['cf-ray'];
+      const cType = String(res.headers['content-type'] || '').toLowerCase();
+      if (!server.includes('cloudflare') && !hasCfRay) { res.resume(); return fin(false, '非CF节点'); }
+      if (cType.includes('text/html')) { res.resume(); return fin(false, '返回HTML'); }
+
+      let lastReport = 0;
+      res.on('data', chunk => {
+        const now = Date.now();
+        if (!ttfb) {
+          ttfb = now - t0;
+          timer = setTimeout(() => fin(true), durationSeconds * 1000);
+        }
+        got += chunk.length;
+        const relMs = now - (t0 + ttfb);
+        timeline.push({ t: relMs, got });
+
+        if (onProgress && now - lastReport >= 500) {
+          lastReport = now;
+          const curSec = relMs / 1000;
+          const curMbps = curSec > 0 ? (got * 8) / curSec / 1e6 : 0;
+          try { onProgress({ elapsedSec: +curSec.toFixed(1), targetSec: durationSeconds, curMbps: +curMbps.toFixed(1) }); } catch {}
+        }
+      });
+      res.on('end', () => fin(true));
+      res.on('error', e => fin(false, e.code || e.message));
+    });
+
+    req.setTimeout(4000, () => req.destroy(new Error('ttfb-timeout')));
+    guardTimer = setTimeout(() => fin(false, 'guard-timeout'), (durationSeconds + 4) * 1000);
+    req.on('error', e => fin(false, e.code || e.message));
+    req.end();
+  });
+}
+
+/**
+ * 轻量预筛：只下载很小的样本（默认 16KB）来判断节点是否真的能用。
+ * 与 download() 的区别：
+ *   - 收满 bytes 就立即结束，不等完整响应（因此耗时极短，通常 <1s）
+ *   - 不做"完整字节数"校验（本来就只收一小段）
+ *   - 保留 CF 身份校验（server/cf-ray）和 HTML 拦截，防止假节点混入
+ * 用途：并发快速淘汰死节点，只把幸存者交给昂贵的串行精测。
+ */
+export function quickProbe(ip, port, bytes = 16384, timeout = 2500) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    let ttfb = 0, got = 0, done = false, guard = null;
+    const fin = (ok, err) => {
+      if (done) return; done = true;
+      if (guard) clearTimeout(guard);
+      try { req && req.destroy(); } catch { /* 忽略 */ }
+      resolve({ ok, ms: Date.now() - t0, ttfb: ok ? ttfb : 0, got, err: err || '' });
+    };
+    const req = https.request({
+      host: ip, port, path: `/__down?bytes=${bytes}`, method: 'GET',
+      servername: 'speed.cloudflare.com', rejectUnauthorized: false,
+      headers: { Host: 'speed.cloudflare.com', 'User-Agent': UA }
+    }, res => {
+      if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
+      const server = String(res.headers['server'] || '').toLowerCase();
+      const hasCfRay = !!res.headers['cf-ray'];
+      const cType = String(res.headers['content-type'] || '').toLowerCase();
+      if (!server.includes('cloudflare') && !hasCfRay) { res.resume(); return fin(false, '非CF'); }
+      if (cType.includes('text/html')) { res.resume(); return fin(false, 'HTML'); }
+      res.on('data', c => {
+        if (!ttfb) ttfb = Date.now() - t0;
+        got += c.length;
+        if (got >= bytes) fin(true);            // 收满即停，不再等后续数据
+      });
+      res.on('end', () => fin(got > 0, got === 0 ? 'empty' : ''));
+      res.on('error', e => fin(false, e.code || e.message));
+    });
+    req.setTimeout(timeout, () => req.destroy(new Error('timeout')));
+    guard = setTimeout(() => fin(false, 'guard-timeout'), timeout + 1500);
     req.on('error', e => fin(false, e.code || e.message));
     req.end();
   });
@@ -433,11 +609,48 @@ export async function measureLocalBandwidth({ seconds = 4, maxBytes = 52428800, 
 
 // ── 网络指纹：换 WiFi / 换运营商后自动重新校准，换回来还能复用原阈值 ──
 export async function getNetworkProfile(log = console.log) {
-  const info = { ip: '', asn: '', isp: '' };
+  const info = { ip: '', asn: '', isp: '', isDirect: false };
+
+  // 1. 优先使用国内直连接口（被代理软件分流直连，拿到你本地物理网卡的真实公网 IP 和运营商）
   try {
-    const t = await httpGet('https://api.ip.sb/geoip', 6000);
-    if (t) { const j = JSON.parse(t); info.ip = j.ip || ''; info.asn = j.asn ? 'AS' + j.asn : ''; info.isp = j.isp || j.organization || ''; }
+    const t = await httpGet('http://myip.ipip.net', 5000);
+    if (t) {
+      // 格式形如：当前 IP：153.37.136.250  来自于：中国 江苏 南通  chinaunicom.com
+      const ipMatch = t.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
+      if (ipMatch) {
+        info.ip = ipMatch[1];
+        info.isDirect = true;
+        const fromMatch = t.match(/来自于[：:]\s*([^\r\n]+)/);
+        if (fromMatch) {
+          const raw = fromMatch[1].trim();
+          info.isp = raw;
+          if (/unicom|联通/i.test(raw)) info.asn = '联通';
+          else if (/telecom|电信/i.test(raw)) info.asn = '电信';
+          else if (/mobile|移动/i.test(raw)) info.asn = '移动';
+          else info.asn = raw.split(/\s+/).pop();
+        }
+      }
+    }
   } catch { /* 忽略 */ }
+
+  if (!info.ip) {
+    try {
+      const t = await httpGet('http://ip.3322.net', 4000);
+      const m = t && t.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})$/);
+      if (m) {
+        info.ip = m[1];
+        info.isDirect = true;
+      }
+    } catch { /* 忽略 */ }
+  }
+
+  // 2. 如果国内直连接口全挂（例如人在国外），回退境外接口
+  if (!info.ip) {
+    try {
+      const t = await httpGet('https://api.ip.sb/geoip', 6000);
+      if (t) { const j = JSON.parse(t); info.ip = j.ip || ''; info.asn = j.asn ? 'AS' + j.asn : ''; info.isp = j.isp || j.organization || ''; }
+    } catch { /* 忽略 */ }
+  }
   if (!info.ip) {
     try {
       const t = await httpGet('https://ipinfo.io/json', 6000);
@@ -455,7 +668,8 @@ export async function getNetworkProfile(log = console.log) {
   }
   const prefix = info.ip ? info.ip.split('.').slice(0, 2).join('.') : 'unknown';
   const key = `${info.asn || 'AS?'}|${prefix}`;
-  log(`网络指纹：${key}${info.isp ? '（' + info.isp + '）' : ''}${info.ip ? '  出口 IP ' + info.ip : ''}`);
+  const routeTag = info.isDirect ? '本地宽带直连' : '代理出口/境外';
+  log(`网络指纹：${key}${info.isp ? '（' + info.isp + '）' : ''}${info.ip ? '  出口 IP ' + info.ip + ' [' + routeTag + ']' : ''}`);
   return { ...info, prefix, key };
 }
 
@@ -611,4 +825,68 @@ export function pruneOldFiles(dir, pattern, keep, log) {
     }
     return victims.length;
   } catch { return 0; }
+}
+// ── 数据源评分：按历史实测命中率给每个源打分，决定测试优先级 ──────────
+// 两个模式共用这一份逻辑，避免各写一份导致不一致。
+//
+// 评分依据（全部来自实际测速结果，不用订阅源标注的任何数值）：
+//   1. 该源历史命中率 = 达标数 / 测试数
+//   2. 小样本用贝叶斯平滑，避免"测1中1"就被当成神源
+//   3. 平均速度做小幅加权
+//   4. tier 只作基础底色（fresh 略优于 legacy），不主导排序
+export function readSourceStats(statFile, ttlDays = 14) {
+  const store = readJson(statFile, { sources: {} });
+  const srcStats = {};
+  const now = Date.now();
+  const ttlMs = Number(ttlDays) * 86400000;
+  for (const [label, v] of Object.entries(store.sources || {})) {
+    if (!v || !v.updatedAt) continue;
+    if (now - Date.parse(v.updatedAt) > ttlMs) continue;   // 太久没更新的记录作废
+    srcStats[label] = v;
+  }
+  return srcStats;
+}
+
+export function makeScoreOf(srcStats) {
+  return function scoreOf(label, tier) {
+    const s = srcStats[label];
+    const base = tier === 'legacy' ? 0.55 : 0.6;
+    if (!s || (s.tested || 0) === 0) return base;           // 冷启动给基础分
+    const tested = s.tested || 0, hit = s.hit || 0;
+    const smoothed = (hit + 0.2 * 8) / (tested + 8);        // 贝叶斯平滑
+    const speedFactor = Math.min(1, (s.avgMbps || 0) / 20);
+    return +(base * (0.4 + smoothed * 1.2 + speedFactor * 0.2)).toFixed(3);
+  };
+}
+
+// 给一组节点打上源评分，并按分组规则排序
+//   groupOf: 返回一个数字表示分组优先级（越小越优先），用于同分时的次要排序
+export function rankBySourceScore(rows, scoreOf, groupOf) {
+  return rows.map(r => {
+    const label = r.sourceLabel || r.tier || 'unknown';
+    return { ...r, srcLabel: label, srcScore: scoreOf(label, r.tier) };
+  }).sort((a, b) => {
+    const g = (groupOf ? groupOf(a) - groupOf(b) : 0);
+    if (g !== 0) return g;
+    return b.srcScore - a.srcScore;                          // 源评分高的优先
+  });
+}
+
+// 把一个源的表现写入统计档案（指数滑动平均，近期权重更高）
+export function updateSourceStats(statFile, perSource) {
+  const store = readJson(statFile, { sources: {} });
+  store.sources ||= {};
+  const blend = (a, b, w = 0.4) => (a == null ? b : a * (1 - w) + b * w);
+  for (const [label, v] of Object.entries(perSource || {})) {
+    const old = store.sources[label] || {};
+    store.sources[label] = {
+      tested: Math.round(blend(old.tested, v.tested)),
+      hit: Math.round(blend(old.hit, v.hit)),
+      avgMbps: +blend(old.avgMbps, v.okCount ? v.sumMbps / v.okCount : 0).toFixed(2),
+      lastRun: { tested: v.tested, hit: v.hit, at: new Date().toISOString() },
+      updatedAt: new Date().toISOString()
+    };
+  }
+  writeJson(statFile, store);
+  return store.sources;
 }

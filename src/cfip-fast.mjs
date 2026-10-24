@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  createLogger, loadSource, download, pool, median,
+  createLogger, loadSource, download, downloadTimed, quickProbe, pool, median,
   createCf, dohCheck, applyFilter, readJson, writeJson,
   measureLocalBandwidth, getNetworkProfile, readProfileStore, saveProfileStore, pruneOldFiles, loadConfig, findBaseDir
 } from './cfip-lib.mjs';
@@ -47,6 +47,8 @@ const F = {
   bandwidthCacheFile: 'var/bandwidth.json', bandwidthCacheHours: 24, bandwidthSeconds: 4,
   targetMbps: 0, targetTtlDays: 30, healthCheck: true, qualityGuard: true, guardRatio: 0.5,
   fallbackAfterProbes: 30, localBandwidthMbps: 0,
+  // 阶段1 并发预筛参数（轻量样本，只判断是否真能用，不追求速度准确）
+  screenBytes: 16384, screenConcurrency: 8, screenTimeoutMs: 2500,
   sourceStatFile: 'var/source-stats.json', sourceStatTtlDays: 14, sourceStatWarmup: 30,
   ...(cfg.fast || {})
 };
@@ -127,6 +129,7 @@ try {
   if (prB || prL) log(`已清理历史文件：备份 ${prB} 个、日志 ${prL} 个（各保留最近 ${keepBak} 份）`);
 
   // 0. 网络指纹 + 历史
+  log('正在识别网络指纹（探测本地宽带出口）…');
   const net = await getNetworkProfile(log);
   const hist = readJson(HISTORY_FILE, { ips: {} });
   const fresh = {};
@@ -188,10 +191,14 @@ try {
   if (F.healthCheck && curIps.length) {
     log('---- 现状体检 ----');
     const healthRounds = Math.max(1, Number(F.healthRounds ?? 2));
+    // 升级为「固定时长稳态测速」：每节点跑 2.5 秒，剥离 0.8s 慢启动
+    // 慢节点绝不死等（2.5s 硬掐断），快节点拉满稳态带宽，精准判断现有 IP 是否真正合格
     const good = [];
     for (const ip of curIps) {
       const samples = [];
-      for (let r = 0; r < healthRounds; r++) samples.push(await download(ip, P, F.probeBytes, F.probeTimeoutMs));
+      for (let r = 0; r < healthRounds; r++) {
+        samples.push(await downloadTimed(ip, P, 2.5, 0.8));
+      }
       const best = samples.filter(s => s.ok).sort((a, b) => b.mbps - a.mbps)[0];
       const ok = !!best && best.mbps >= target;
       const shown = best ? `${best.mbps}Mbps` : `不通(${samples[0]?.err || '?'})`;
@@ -213,7 +220,7 @@ try {
 
   // 4. 拉源 + 按「数据源历史表现」动态排序
   const all = await loadSource(cfg.source, CFG_DIR, log);
-  log(`源记录：${all.length} 条，其中带速度标注 ${all.filter(r => r.fileMbps > 0).length} 条`);
+  log(`源记录：${all.length} 条`);
   if (!all.length) throw new Error('源里没有可解析的 IP');
 
   // ── 读数据源表现档案，算出每个源的优先级分数 ──────────────────
@@ -245,11 +252,12 @@ try {
     return { ...r, srcLabel: label, srcScore: scoreOf(label, r.tier) };
   });
 
-  // 排序：历史实测过的活节点最优先 → 源分数高的优先 → 同源内标注速度高的优先
+  // 排序：历史实测过的活节点最优先 → 源分数高的优先
+  // （不参考标称速度：实测与实际毫无相关性，只会引入噪声）
   const histRanked = withScore.filter(r => fresh[r.ip]).sort((a, b) => fresh[b.ip].mbps - fresh[a.ip].mbps);
   const histIps = new Set(histRanked.map(r => r.ip));
   const restAll = withScore.filter(r => !histIps.has(r.ip) && r.port === P)
-    .sort((a, b) => (b.srcScore - a.srcScore) || (b.fileMbps - a.fileMbps) || (a.fileMs - b.fileMs));
+    .sort((a, b) => b.srcScore - a.srcScore);
   const curRanked = curIps.map(ip => withScore.find(r => r.ip === ip) || { ip, port: P, cc: '', fileMs: 0, fileMbps: 0, srcLabel: '(现用)', srcScore: 9 });
   const seenIp = new Set();
   const queue = [...curRanked, ...histRanked, ...restAll]
@@ -272,13 +280,49 @@ try {
   });
   log(`候选队列：${queue.length} 个（按源优先级排序测试）`);
 
-  // 5. 顺序测试 + 早停
+  // 5. 两阶段测速：并发预筛（淘汰死节点）→ 串行精测（准确测速）
+  //    为什么这样拆：预筛只关心"通不通"，并发不抢带宽也无所谓；精测要准，必须串行。
   const tested = new Map();
   let stopped = false, adjusted = false, warned = false;
   const minProbe = Math.max(1, Number(F.minProbe ?? 60));
   const deadline = Date.now() + F.maxSeconds * 1000;
-  log('---- 边测边收（达标即计数，凑够就停）----');
-  await pool(queue, Math.max(1, Number(F.probeConcurrency)), async c => {
+  const srcTagOf = c => (c.srcLabel ? ` 〔${c.srcLabel.slice(0, 12)}〕` : '');
+
+  // ── 阶段1：并发预筛 ────────────────────────────────────────────
+  const screenBytes = Number(F.screenBytes ?? 16384);
+  const screenConc = Math.max(1, Number(F.screenConcurrency ?? 8));
+  const screenTimeout = Number(F.screenTimeoutMs ?? 2500);
+  const survivors = [];
+  if (screenBytes > 0 && queue.length > 1) {
+    log(`---- 阶段1/2：并发预筛 ${queue.length} 个（${(screenBytes / 1024).toFixed(0)}KB 样本，并发 ${screenConc}）----`);
+    log(`   正在并发连接各节点，结果会逐个出现…`);
+    const tS = Date.now();
+    let doneCnt = 0;
+    const total = queue.length;
+    await pool(queue, screenConc, async c => {
+      const r = await quickProbe(c.ip, c.port, screenBytes, screenTimeout);
+      doneCnt++;
+      const tag = r.ok ? '✓' : '✗';
+      const info = r.ok ? `${r.ms}ms` : (r.err || '失败');
+      const srcTag = srcTagOf(c);
+      if (r.ok) survivors.push(c);
+      // 每个节点完成都立即输出，让人明确看到进度在走（不会像卡死）
+      const aliveNow = survivors.length;
+      log(`   [${doneCnt}/${total}] ${tag} ${c.ip.padEnd(15)} ${info.padEnd(14)}${srcTag}  (存活 ${aliveNow})`);
+    });
+    const screenSec = ((Date.now() - tS) / 1000).toFixed(1);
+    const killRate = queue.length ? ((1 - survivors.length / queue.length) * 100).toFixed(0) : 0;
+    log(`预筛完成：${survivors.length}/${queue.length} 存活（淘汰 ${killRate}%），耗时 ${screenSec}s`);
+    log(`---- 阶段2/2：串行精测存活节点（准确测速，避免并发抢带宽）----`);
+  } else {
+    log('---- 边测边收（达标即计数，凑够就停）----');
+    survivors.push(...queue);
+  }
+
+  const testQueue = survivors;   // 只对存活者做精测
+
+  // ── 阶段2：串行精测 + 早停 ─────────────────────────────────────
+  await pool(testQueue, Math.max(1, Number(F.probeConcurrency)), async c => {
     if (stopped) return;
     if (Date.now() > deadline) { if (!stopped) { stopped = true; log(`   ! 达到时间上限 ${F.maxSeconds}s，停止探测`); } return; }
     if (collected.some(x => x.ip === c.ip)) return;
@@ -290,19 +334,33 @@ try {
         if (nt < target) { log(`   达标线 ${target}Mbps 偏高（跨境很难达到本地带宽的 ${F.targetRatio}），自动校准为 观测峰值×${F.targetRatio} = ${nt}Mbps`); target = nt; targetSrc = '本轮实测校准'; }
       }
     }
-    const d = await download(c.ip, c.port, F.probeBytes, F.probeTimeoutMs);
+    // 阶段2 精测：每节点固定跑 1.5 秒，时间一到硬斩断，绝不死等拖延！
+    const idx = tested.size + 1;
+    const d = await downloadTimed(c.ip, c.port, 1.5, 0.4, p => {
+      log(`   精测 [${idx}/${testQueue.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
+    });
     tested.set(c.ip, d);
-    if (d.ok && d.mbps >= target) {
+    const prog = `${tested.size}/${testQueue.length}`;       // 整体进度，让用户看到还在动
+    const srcTag = srcTagOf(c);
+    // 门槛预选：由于 1.5s 短测时间较短，按 target * preselectRatio 做宽松预选进复核
+    const preselect = Math.max(F.floorMbps, +(target * Number(F.preselectRatio ?? 0.4)).toFixed(2));
+    if (d.ok && d.mbps >= preselect) {
       collected.push({ ip: c.ip, cc: c.cc, port: c.port, mbps: d.mbps, ttfb: d.ttfb, srcLabel: c.srcLabel || '' });
       const shown = Math.min(collected.length, F.targetCount);
-      const srcTag = c.srcLabel ? ` 〔${c.srcLabel.slice(0, 12)}〕` : '';
-      log(`   [${shown}/${F.targetCount}] ${c.ip} ${c.cc} ${d.mbps}Mbps/${d.ttfb}ms${srcTag}`);
+      const tag = d.mbps >= target ? '' : `（预选，待复核确认≥${target}）`;
+      log(`   [${shown}/${F.targetCount}] ✓ ${c.ip} ${c.cc} ${d.mbps}Mbps/${d.ttfb}ms${tag}${srcTag}`);
       if (collected.length >= F.targetCount) {
-        if (tested.size >= minProbe) { stopped = true; log(`   已凑够 ${F.targetCount} 个达标节点，提前停止（共测 ${tested.size} 个，队列还剩 ${queue.length - tested.size} 个没测）`); }
-        else if (!warned) { warned = true; log(`   已凑够 ${F.targetCount} 个，为保证质量继续多测到 ${minProbe} 个再停`); }
+        if (tested.size >= minProbe) { stopped = true; log(`   已凑够 ${F.targetCount} 个候选，提前停止（共精测 ${tested.size} 个）`); }
+        else if (!warned) { warned = true; log(`   已凑够 ${F.targetCount} 个候选，为保证质量继续多测到 ${minProbe} 个再停`); }
       }
-    } else if (!d.ok && cfg.behavior.verbose) log(`   - ${c.ip} 不通(${d.err})`);
+    } else if (d.ok) {
+      log(`   ${prog} ✗ ${c.ip} ${c.cc} ${d.mbps}Mbps 低于预选线(${preselect})${srcTag}`);
+    } else {
+      log(`   ${prog} ✗ ${c.ip} 失败(${d.err})${srcTag}`);
+    }
   });
+  // 精测阶段结束提示
+  if (survivors.length) log(`精测完成：共测 ${tested.size} 个存活节点`);
 
   // ── 更新数据源表现档案（供下次按表现排序）────────────────────
   {
@@ -353,26 +411,44 @@ try {
     candidateList = candidateList.concat(extras);
   }
   const finalists = candidateList.sort((a, b) => b.mbps - a.mbps).slice(0, wantMin);
-  log(`---- 复核前 ${finalists.length} 名（${F.verifyRounds} 轮串行）----`);
+  // 阶段3 复核：升级为「固定时长稳态测速」，每节点严格跑 3.0 秒（剥离前 0.8s 慢启动）
+  // 彻底避免固定 4MB 遇到慢节点要卡 16 秒的痛点，跑满 3 秒立即算稳态速度并评级！
+  const verifySec = Number(F.verifyDurationSec ?? 3.0);
+  const warmSec = Number(F.verifyWarmSec ?? 0.8);
+  log(`---- 复核 ${finalists.length} 名（${F.verifyRounds} 轮串行，每轮严格跑 ${verifySec} 秒求稳态极限）----`);
   for (let r = 1; r <= F.verifyRounds; r++) {
+    let i = 0;
     for (const c of finalists) {
-      const d = await download(c.ip, c.port, cfg.probe.bytes || F.probeBytes, cfg.probe.downloadTimeoutMs || 6000);
+      i++;
+      const d = await downloadTimed(c.ip, c.port, verifySec, warmSec, p => {
+        log(`   复核 第${r}轮 [${i}/${finalists.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
+      });
       (c.samples ||= []).push(d);
+      const st = d.ok ? `${d.mbps}Mbps (稳态)` : `失败(${d.err})`;
+      log(`   复核 第${r}轮 [${i}/${finalists.length}] ${c.ip.padEnd(15)} → ${st}`);
     }
-    log(`   第 ${r}/${F.verifyRounds} 轮复核完成`);
   }
+  // 最终排名用大样本复核结果，并以真实速度重新判定达标
   const ranked = finalists.map(c => {
     const ok = (c.samples || []).filter(s => s.ok);
     return { ...c, mbps: median(ok.map(s => s.mbps)) || c.mbps, ttfb: median(ok.map(s => s.ttfb)) || c.ttfb, okRate: ok.length / Math.max(1, (c.samples || []).length) };
-  }).filter(r => r.okRate >= 0.5).sort((a, b) => b.mbps - a.mbps || a.ttfb - b.ttfb);
-  log('---- 复核排名 ----');
-  for (const r of ranked) log(`   ${r.ip.padEnd(16)} ${r.cc} ${String(r.mbps).padStart(7)}Mbps  ttfb=${r.ttfb}ms`);
-  if (!ranked.length) throw new Error('复核后没有稳定节点，保留现有 DNS 记录不变');
+  }).filter(r => r.okRate >= 0.5)
+    .sort((a, b) => b.mbps - a.mbps || a.ttfb - b.ttfb);
 
-  // 7. 方案 + 比对
+  const passed = ranked.filter(r => r.mbps >= target);
+  log('---- 复核排名（大样本实测，仅供参考）----');
+  for (const r of ranked) {
+    const mark = r.mbps >= target ? '✔ 达标' : `✘ 低于${target}`;
+    log(`   ${r.ip.padEnd(16)} ${r.cc} ${String(r.mbps).padStart(7)}Mbps  ttfb=${r.ttfb}ms  ${mark}`);
+  }
+  log(`复核结论：${passed.length}/${ranked.length} 个真实达标（≥${target}Mbps）`);
+  if (!passed.length) throw new Error(`复核后没有节点达到 ${target}Mbps，保留现有 DNS 记录不变`);
+  // 后续方案只用真正达标的节点
+  const finalRanked = passed;
+  // 7. 方案 + 比对（只用真实达标的节点）
   const plan = (cfg.cloudflare.records || []).map(rec => {
     const limit = Math.min(rec.topN ?? F.uploadCount, F.uploadCount);
-    const picked = applyFilter(ranked, rec.filter).slice(0, limit);
+    const picked = applyFilter(finalRanked, rec.filter).slice(0, limit);
     return { rec, detail: picked, ips: picked.map(r => r.ip) };
   });
   log('---- 上传方案 ----');
@@ -402,22 +478,22 @@ try {
     log(flag('--dry-run')
       ? 'DRY-RUN：以上为方案，未调用 Cloudflare 写接口。'
       : '只测速模式（未配置 Cloudflare 凭据 / behavior.dryRun=true）：未调用 Cloudflare 写接口，DNS 记录未变动。');
-    saveHistory(ranked);
+    saveHistory(finalRanked);
     throw new ExitError(0);
   }
   if (!changed && cfg.behavior.skipIfUnchanged && !flag('--force')) {
     log('结论：已是最优集合，跳过写入。');
-    saveHistory(ranked);
+    saveHistory(finalRanked);
     writeJson(STATE_FILE, { lastRunAt: new Date().toISOString(), mode: 'fast', networkKey: net.key, skipped: true, target, plan: plan.map(p => ({ name: p.rec.name, ips: p.next })) });
     throw new ExitError(0);
   }
   // 质量保护：本次明显不如上次时不要替换
   const lastBest = Number(hist.lastRunBest || 0) || Math.max(0, ...Object.values(fresh).map(v => v.mbps || 0));
   const guardRatio = Number(F.guardRatio ?? 0.5);
-  if (F.qualityGuard !== false && lastBest > 0 && ranked[0].mbps < lastBest * guardRatio && !flag('--force')) {
-    log(`   质量保护触发：本次最佳 ${ranked[0].mbps}Mbps < 上次运行最佳 ${lastBest}Mbps × ${guardRatio}，跳过写入（要强制请加 --force）`);
-    saveHistory(ranked);
-    writeJson(STATE_FILE, { lastRunAt: new Date().toISOString(), mode: 'fast', guarded: true, lastBest, best: ranked[0].mbps });
+  if (F.qualityGuard !== false && lastBest > 0 && finalRanked[0].mbps < lastBest * guardRatio && !flag('--force')) {
+    log(`   质量保护触发：本次最佳 ${finalRanked[0].mbps}Mbps < 上次运行最佳 ${lastBest}Mbps × ${guardRatio}，跳过写入（要强制请加 --force）`);
+    saveHistory(finalRanked);
+    writeJson(STATE_FILE, { lastRunAt: new Date().toISOString(), mode: 'fast', guarded: true, lastBest, best: finalRanked[0].mbps });
     throw new ExitError(0);
   }
   if (DRY) throw new Error('内部保护：dry-run 状态下不应进入写入流程');
@@ -479,7 +555,7 @@ try {
       log(`   公网解析 ${p.rec.name}: ${p.next.every(ip => pub.includes(ip)) ? 'OK' : '缓存未过期/待刷新（TTL 300s）'} [${pub.join(',')}]`);
     }
   }
-  saveHistory(ranked);
+  saveHistory(finalRanked);
   writeJson(STATE_FILE, {
     lastRunAt: new Date().toISOString(), mode: 'fast', networkKey: net.key, ok: allOk, target, targetSrc,
     testedCount: tested.size, collectedCount: collected.length,
