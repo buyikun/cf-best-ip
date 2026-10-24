@@ -177,6 +177,7 @@ var\                                        ← 运行产物，删了也不影�
 | 文件（相对本文件夹） | 作用 |
 |---|---|
 | **`user.config.jsonc`** | ★ **你填写的变量文件**：CF 凭据、域名、阈值等，注释详细；不填就不上传 |
+| `update.cmd` | ★ **一键在线升级**：双击即可从 GitHub 更新最新代码，自动保留你的个人配置与历史记录 |
 | `README.md` | 本文档 |
 | `run-fast.cmd` / `run-full.cmd` | 双击即跑（快速模式 / 全量模式） |
 | `run-cfip.cmd` | 命令行通用入口，可带 `fast`/`full` 和参数 |
@@ -185,6 +186,7 @@ var\                                        ← 运行产物，删了也不影�
 | `src\cfip-auto.mjs` | 全量模式主流程 |
 | `src\cfip-lib.mjs` | 两者共用的工具（源拉取/解析、探测、CF API、DoH 校验、配置加载、带宽探测、旧文件清理） |
 | `src\cfip.config.json` | 程序内置默认参数（凭据段是占位，永远不会被使用） |
+| `src\update.ps1` | 一键在线升级核心脚本（带多线路加速与用户配置保护） |
 | `src\make-desktop-shortcuts.ps1` | 快捷方式脚本本体（支持 `-Remove`、`-Prefix`） |
 | `src\cf-api.mjs` | 手工运维小工具：`node src\cf-api.mjs list` 列记录 / `set <域名> <ip,ip,...>` 指定记录 |
 | `var\logs\latest.log` | 最近一次运行日志（只保留最近 3 次 + latest） |
