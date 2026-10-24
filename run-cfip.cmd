@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 rem ===================================================================
 rem  CF 优选 IP —— 命令行通用入口
 rem  用法：run-cfip.cmd [fast|full] [--dry-run] [--force] [--probe N] ...
@@ -8,7 +9,6 @@ rem    run-cfip.cmd fast --dry-run     只出方案，不写 Cloudflare
 rem    run-cfip.cmd fast --skip-health 跳过现状体检，强制重新优选
 rem ===================================================================
 setlocal
-chcp 65001 >nul
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
