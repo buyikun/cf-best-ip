@@ -27,7 +27,7 @@ const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] 
 
 const CONFIG_PATH = path.resolve(HERE, opt('--config', 'cfip.config.json'));   // 内置默认配置随程序在 src\
 const USER_CONFIG_PATH = path.resolve(BASE, opt('--user-config', 'user.config.jsonc'));  // 用户配置在根目录
-const { cfg, userPath, uploadReady } = loadConfig(CONFIG_PATH, USER_CONFIG_PATH);
+const { cfg, userPath, uploadReady, userError, missing, suspicious, userConfigExists } = loadConfig(CONFIG_PATH, USER_CONFIG_PATH);
 if (!uploadReady) cfg.behavior.dryRun = true;   // 没填凭据 = 强制只测速，绝不写 DNS
 const FORCE = flag('--force');
 const VERBOSE = flag('--verbose');
@@ -198,16 +198,41 @@ function applyFilter(rows, filter) {
 // ── 主流程 ────────────────────────────────────────────────────────
 armGlobalTimeout();
 log('=========== CF 优选自动化任务开始 ===========');
-log(`配置：${path.basename(CONFIG_PATH)}${uploadReady ? ' + ' + path.basename(userPath) : '（未配置用户变量文件）'}${DRY_RUN ? '  [DRY-RUN 不写 Cloudflare]' : ''}${FORCE ? '  [--force]' : ''}`);
+log(`配置：${path.basename(CONFIG_PATH)}${uploadReady ? ' + ' + path.basename(userPath) : '（未配置上传信息）'}${DRY_RUN ? '  [DRY-RUN 不写 Cloudflare]' : ''}${FORCE ? '  [--force]' : ''}`);
+if (suspicious && suspicious.length) {
+  log('');
+  log('  ⚠ 检测到疑似示例/无效域名：');
+  for (const s of suspicious) log(`     - ${s.name}`);
+  log('     这些域名不在你的 Cloudflare 账号下，写入时会失败（其余域名不受影响）。');
+  log('     请打开 user.config.jsonc，把 domains 里的名字改成你自己的域名。');
+  log('');
+}
 if (!uploadReady) {
   log('');
-  log('  ┌────────────────────────────────────────────────────────────┐');
-  log('  │  还没有配置 Cloudflare，本次运行 = 演示模式                │');
-  log('  │  · 只测速、只打印结果，绝不会改动你的 DNS                  │');
-  log('  │  · 想正式使用：用记事本打开 user.config.jsonc，填三样：    │');
-  log('  │      apiToken / zoneId / records（文件里每项都有中文说明） │');
-  log('  └────────────────────────────────────────────────────────────┘');
-  log('');
+  // 配置写错时先给出明确的错误，别让用户以为是"没配置"
+  if (userError) {
+    log('  ┌────────────────────────────────────────────────────────────┐');
+    log('  │  ⚠ 你的配置文件有问题，已退回“只测速”模式                  │');
+    log('  └────────────────────────────────────────────────────────────┘');
+    log(`  ${userError}`);
+    log('');
+  } else if (userConfigExists && missing && missing.length) {
+    log('  ┌────────────────────────────────────────────────────────────┐');
+    log('  │  配置文件已找到，但还缺少上传必需项，本次 = 只测速模式      │');
+    log('  └────────────────────────────────────────────────────────────┘');
+    log(`  未填的项：${missing.join(' / ')}`);
+    log('  提示：这三项都要填齐才会真正上传（文件里每项都有中文说明）');
+    log('');
+  } else {
+    log('  ┌────────────────────────────────────────────────────────────┐');
+    log('  │  还没有配置 Cloudflare，本次运行 = 演示模式                │');
+    log('  │  · 只测速、只打印结果，绝不会改动你的 DNS                  │');
+    log('  │  · 想正式使用：把 user.config.jsonc.example 改名为         │');
+    log('  │      user.config.jsonc，然后填三样：                        │');
+    log('  │      apiToken / zoneId / domains（文件里每项都有中文说明） │');
+    log('  └────────────────────────────────────────────────────────────┘');
+    log('');
+  }
   // 演示模式：缩小规模，一两分钟就出结果
   cfg.probe.candidates = Math.min(Number(cfg.probe.candidates) || 150, 12);
   cfg.probe.rounds = 1;
@@ -342,11 +367,19 @@ try {
   }
   log('---- 目标方案 ----');
   for (const p of plan) log(`   ${p.rec.name} (${p.rec.type}, top${p.rec.topN}) <- ${p.ips.join(', ') || '(空)'}`);
+  // 【安全护栏】筛选结果为 0 个节点时，绝不参与写入。
+  //   否则 keep 为空集合 → 该域名现有 A 记录会被全部删除。
+  //   典型误配：filter.mode="allow" 但国家码拼错（如写成 SGP 而不是 SG）。
+  const actionable = [];
+  for (const p of plan) {
+    if (p.ips.length === 0) log(`   ⚠ ${p.rec.name}：按 filter 筛选后 0 个节点，已跳过该域名（不会清空现有记录）`);
+    else actionable.push(p);
+  }
 
   // 7. 与现状比对
   const current = uploadReady ? await listRecords() : [];
   let changed = false;
-  for (const p of plan) {
+  for (const p of actionable) {
     const cur = current.filter(r => r.name === p.rec.name && r.type === p.rec.type).map(r => r.content).sort();
     const next = [...p.ips].sort();
     p.current = cur; p.next = next;
@@ -364,11 +397,11 @@ try {
   }
   if (!changed && cfg.behavior.skipIfUnchanged && !FORCE) {
     log('结论：所有记录已是最优集合，跳过写入。');
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ lastRunAt: new Date().toISOString(), skipped: true, plan: plan.map(p => ({ name: p.rec.name, ips: p.next })) }, null, 2));
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ lastRunAt: new Date().toISOString(), skipped: true, plan: actionable.map(p => ({ name: p.rec.name, ips: p.next })) }, null, 2));
     throw new ExitError(0);
   }
 
-  const targets = FORCE ? plan : plan.filter(p => !p.same);
+  const targets = FORCE ? actionable : actionable.filter(p => !p.same);
   if (DRY_RUN) throw new Error('内部保护：dry-run 状态下不应进入写入流程');
 
   // 8. 备份
@@ -378,21 +411,31 @@ try {
     log(`已备份现有记录：${bak}`);
   }
 
-  // 9. 写入
+  // 9. 写入（先增后删，避免中途失败导致记录变少）
   for (const p of targets) {
     const existing = current.filter(r => r.name === p.rec.name && r.type === p.rec.type);
     const keep = new Set(p.next);
-    for (const r of existing) {
-      if (!keep.has(r.content)) { await deleteRecord(r.id); log(`   DEL ${p.rec.name} ${r.content}`); }
-    }
+    const toDelete = existing.filter(r => !keep.has(r.content));
     const have = new Set(existing.map(r => r.content));
-    for (const ip of p.next) {
-      if (have.has(ip)) continue;
-      await createRecord({
-        type: p.rec.type, name: p.rec.name, content: ip,
-        ttl: p.rec.ttl ?? 300, proxied: p.rec.proxied ?? false, comment: 'cf-best-ip-auto'
-      });
-      log(`   ADD ${p.rec.name} ${ip}`);
+    const toAdd = p.next.filter(ip => !have.has(ip));
+    // ① 先新增
+    try {
+      for (const ip of toAdd) {
+        await createRecord({
+          type: p.rec.type, name: p.rec.name, content: ip,
+          ttl: p.rec.ttl ?? 300, proxied: p.rec.proxied ?? false, comment: 'cf-best-ip-auto'
+        });
+        log(`   ADD ${p.rec.name} ${ip}`);
+      }
+    } catch (e) {
+      log(`   ✗ ${p.rec.name} 新增失败，跳过这条记录（保持现状不改动）：${e.message}`);
+      continue;
+    }
+    // ② 新增成功后再删旧
+    try {
+      for (const r of toDelete) { await deleteRecord(r.id); log(`   DEL ${p.rec.name} ${r.content}`); }
+    } catch (e) {
+      log(`   ✗ ${p.rec.name} 删除旧记录失败：${e.message}`);
     }
   }
 
@@ -400,7 +443,7 @@ try {
   log('---- 验证 ----');
   const after = await listRecords();
   let allOk = true;
-  for (const p of plan) {
+  for (const p of actionable) {
     const got = after.filter(r => r.name === p.rec.name && r.type === p.rec.type).map(r => r.content).sort();
     const want = [...p.next].sort();
     const ok = got.length === want.length && got.every((v, i) => v === want[i]);

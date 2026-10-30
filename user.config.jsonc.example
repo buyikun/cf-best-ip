@@ -62,7 +62,19 @@
       "type": "A",          /* 一般固定 "A"（IPv4） */
       "ttl": 300,           /* 缓存秒数，300=5 分钟；填 1 表示 CF 的 Auto */
       "proxied": false,     /* 是否开 CF 小云朵。优选 IP 必须 false */
-      "topN": 3             /* 每个域名保留几个 IP（快速模式还会受 uploadCount 限制） */
+      "topN": 3,            /* 每个域名保留几个 IP（快速模式还会受 uploadCount 限制） */
+
+      /* 按国家/地区码筛选节点（不需要筛选就保持 tokens: []，或整行删掉）：
+       *   mode = "deny"   → 排除 tokens 里列出的国家
+       *   mode = "allow"  → 只保留 tokens 里列出的国家
+       *   tokens = []     → 不筛选，所有国家的节点都参与测速
+       *
+       * 多个国家就在数组里加多项，用逗号分隔（大小写随意，程序自动转大写）：
+       *   "filter": { "mode": "allow", "tokens": ["HK", "SG", "JP"] }   只用港/新/日
+       *   "filter": { "mode": "deny",  "tokens": ["JP", "KR"] }         排除日本和韩国
+       *
+       * 国家码完整列表见本文件末尾「七、国家码是什么」。 */
+      "filter": { "mode": "deny", "tokens": [] }
     }
   },
 
@@ -71,11 +83,12 @@
    * ──────────────────────────────────────────────────────────────── */
   "source": {
     "urls": [
-      { "url": "https://api.uouin.com/cloudflare.html", "tier": "fresh",  "name": "麒麟优选(HTML,高频更新)" },
-      { "url": "https://cf.junzhen.qzz.io/full_ips.txt", "tier": "fresh",  "name": "junzhen四川联通" },
-      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" },
-      { "url": "https://raw.githubusercontent.com/HandsomeMJZ/cfip/refs/heads/main/full_ips.txt", "tier": "legacy", "name": "GitHub主源(较旧)" },
-      { "url": "https://cdn.jsdelivr.net/gh/HandsomeMJZ/cfip@main/full_ips.txt", "tier": "legacy", "name": "jsDelivr镜像(较旧)" }
+      /* 每个源一行。前面的是实测命中率更高的源；要删源直接删掉那一行即可。
+       * tier:"legacy" 的源会被排在后面测（适合更新慢的老源）。 */
+      { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/xinyitang3/ipv4.txt", "tier": "fresh", "name": "Mia优选(港/新/韩/日/美)" },
+      { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/tiancheng/all.txt",   "tier": "fresh", "name": "天诚优选1(港/新/韩/日/美/台/德)" },
+      { "url": "https://api.uouin.com/cloudflare.html",                                     "tier": "fresh", "name": "麒麟优选(HTML,运营商分组)" },
+      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt",                                 "tier": "fresh", "name": "junzhen北京电信" }
     ],
     "merge": true,            /* true=合并所有源；false=只用第一个能拉到的 */
     "preferUrl": true,        /* true=优先线上订阅，全失败才用本地缓存 */

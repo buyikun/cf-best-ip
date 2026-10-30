@@ -40,19 +40,60 @@ export function createLogger(logDir, runId) {
 // 旧版格式： 1.2.3.4:443#JP [45ms 12Mbps]
 const RE_SPEED = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)#([A-Z]{2})?\s*\[(?:高速\s*by\s*Jz\s+)?(\d+)\s*M\]\s*$/;
 const RE_LAT_BW = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)#([A-Z]{2})?\s*\[(\d+)ms\s+([\d.]+)\s*Mbps\]\s*$/;
-const RE_LOOSE = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?(?:#([A-Z]{2}))?/;
+// 尾部 (?=[\s|,;)\]]|$) 很关键：国家码后面必须是分隔符或行尾，
+// 否则 `#VPS789优选`、`#CFYes`、`#CM优选` 会被误读成 VP / CF / CM 这样的假国家码。
+const RE_LOOSE = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?(?:#([A-Z]{2})(?=[\s|,;)\]]|$))?/;
+
+// 常见国家/地区码白名单。
+// 用途：很多聚合订阅（free-nodes/bestcf 等）把国家码写在 # 后面的自由文本里，
+// 形如 `1.2.3.4:443#天诚优选1 | 港岛茶记 | HK | 1.2.3.4:443`，
+// 而不是紧贴 # 的 `#HK`。靠白名单从这段文本里挑出国家码，
+// 可以避免把「TG:@MiaChatChannel」的 TG、「…Entry IP TOP50」的 IP 之类误当成国家。
+const CC_WHITELIST = new Set([
+  'HK', 'TW', 'MO', 'JP', 'KR', 'KP', 'MN',
+  'SG', 'MY', 'TH', 'VN', 'PH', 'ID', 'KH', 'LA', 'MM', 'BN',
+  'IN', 'PK', 'BD', 'LK', 'NP',
+  'AU', 'NZ', 'GU',
+  'US', 'CA', 'MX', 'BR', 'AR', 'CL', 'CO', 'PE', 'VE', 'EC', 'UY', 'PY', 'BO', 'CR', 'PA', 'PR', 'VI',
+  'GB', 'UK', 'IE', 'FR', 'DE', 'NL', 'BE', 'LU', 'CH', 'AT', 'IT', 'ES', 'PT', 'MT', 'CY', 'GR',
+  'SE', 'NO', 'FI', 'DK', 'IS', 'PL', 'CZ', 'SK', 'HU', 'RO', 'BG', 'HR', 'SI', 'RS', 'EE', 'LV', 'LT',
+  'RU', 'UA', 'BY', 'MD', 'GE', 'AM', 'AZ', 'KZ', 'UZ',
+  'TR', 'IL', 'AE', 'SA', 'QA', 'KW', 'BH', 'OM', 'JO', 'LB',
+  'ZA', 'EG', 'NG', 'KE', 'MA', 'TN', 'DZ', 'GH', 'TZ', 'UG',
+  'CN'
+]);
+
+// 零宽字符等不可见字符：某些源（bestcf.tools12345.com 系）为防止被脚本抓取，
+// 会在字母之间插入 U+200B 零宽空格 —— 看起来是 "HK"，实际字节是 "H\u200BK"。
+// 注意这里只清零宽类字符，不把普通空格/NBSP 也删掉，否则 "HK TG" 会粘成 "HKTG"。
+const INVISIBLE_RE = /[\u200b\u200c\u200d\u200e\u200f\u2060\ufeff\u00ad\u180e]/g;
+
+/** 从 # 后面的自由文本里挑一个国家/地区码；挑不到返回 '' */
+function ccFromNote(note) {
+  if (!note) return '';
+  const cleaned = note.replace(INVISIBLE_RE, '');
+  for (const tok of cleaned.split(/[^A-Za-z]+/)) {
+    if (tok.length !== 2) continue;
+    const up = tok.toUpperCase();
+    if (CC_WHITELIST.has(up)) return up;
+  }
+  return '';
+}
 
 export function parseLines(text, defaultPort = 443) {
   const out = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
+    // # 后面是一段自由文本注释；有些源把国家码写在这里面
+    const hash = line.indexOf('#');
+    const note = hash >= 0 ? line.slice(hash + 1) : '';
     let m = line.match(RE_SPEED);
-    if (m) { out.push({ ip: m[1], port: +m[2], cc: m[3] || '', fileMs: 0, fileMbps: +m[4] }); continue; }
+    if (m) { out.push({ ip: m[1], port: +m[2], cc: m[3] || ccFromNote(note), fileMs: 0, fileMbps: +m[4] }); continue; }
     m = line.match(RE_LAT_BW);
-    if (m) { out.push({ ip: m[1], port: +m[2], cc: m[3] || '', fileMs: +m[4], fileMbps: +m[5] }); continue; }
+    if (m) { out.push({ ip: m[1], port: +m[2], cc: m[3] || ccFromNote(note), fileMs: +m[4], fileMbps: +m[5] }); continue; }
     m = line.match(RE_LOOSE);
-    if (m) out.push({ ip: m[1], port: m[2] ? +m[2] : defaultPort, cc: m[3] || '', fileMs: 0, fileMbps: 0 });
+    if (m) out.push({ ip: m[1], port: m[2] ? +m[2] : defaultPort, cc: m[3] || ccFromNote(note), fileMs: 0, fileMbps: 0 });
   }
   const seen = new Set();
   return out.filter(r => (seen.has(r.ip) ? false : (seen.add(r.ip), true)));
@@ -162,12 +203,17 @@ export async function loadSource(sourceCfg, cfgDir, log) {
       const label = (typeof entry === 'object' && entry.name) || '';
       if (!u) continue;
       const txt = await httpGet(u);
-      const rows = txt ? parseAny(txt) : [];          // 自动兼容 HTML 表格与纯文本订阅
-      if (!rows.length) { log(`   源不可用或解析为空，跳过：${u}`); if (s.merge) continue; else break; }
+      const rowsAll = txt ? parseAny(txt) : [];       // 自动兼容 HTML 表格与纯文本订阅
+      if (!rowsAll.length) { log(`   源不可用或解析为空，跳过：${u}`); if (s.merge) continue; else break; }
+      // DNS 的 A 记录只能写 IP、不能写端口，用户访问默认走 443。
+      // 所以只保留 443 端口的节点；其余端口（8443/2087/11371…）写进 DNS 也访问不通。
+      const rows = rowsAll.filter(r => r.port === 443);
+      const droppedPort = rowsAll.length - rows.length;
+      if (!rows.length) { log(`   源里没有 443 端口的节点，跳过：${u}`); if (s.merge) continue; else break; }
       used++;
       const kind = txt && looksLikeHtml(txt) ? 'HTML表格' : '纯文本';
       const tag = tier === 'legacy' ? '旧源' : '新鲜源';
-      log(`源：${u}${label ? ` [${label}]` : ''}（${rows.length} 个节点，${kind}，${tag}）`);
+      log(`源：${u}${label ? ` [${label}]` : ''}（${rows.length} 个 443 节点${droppedPort ? `，另有 ${droppedPort} 个非 443 端口已忽略` : ''}，${kind}，${tag}）`);
       await noteFreshness(u, log);
       for (const r of rows) {
         const prev = merged.get(r.ip);
@@ -199,9 +245,12 @@ export async function loadSource(sourceCfg, cfgDir, log) {
     log('   所有线上源均失败，改用本地缓存/文件');
   }
 
+  // 缓存/快照里可能残留历史写入的非 443 端口条目，这里同样只保留 443
+  const pick443 = list => list.filter(r => r.port === 443);
+
   if (cachePath && fs.existsSync(cachePath)) {
-    const rows = parseLines(fs.readFileSync(cachePath, 'utf8'));
-    if (rows.length) { log(`源：本地缓存 ${cachePath}（${rows.length} 个节点）`); return rows; }
+    const rows = pick443(parseLines(fs.readFileSync(cachePath, 'utf8')));
+    if (rows.length) { log(`源：本地缓存 ${cachePath}（${rows.length} 个 443 节点）`); return rows; }
   }
 
   const file = s.file;
@@ -209,7 +258,7 @@ export async function loadSource(sourceCfg, cfgDir, log) {
   const ageMin = (Date.now() - fs.statSync(file).mtimeMs) / 60000;
   log(`源：${file}（${ageMin.toFixed(0)} 分钟前更新）`);
   if (s.maxAgeMinutes > 0 && ageMin > s.maxAgeMinutes) log(`   警告：文件已超过 maxAgeMinutes=${s.maxAgeMinutes}，可能是旧数据`);
-  return parseLines(fs.readFileSync(file, 'utf8'));
+  return pick443(parseLines(fs.readFileSync(file, 'utf8')));
 }
 
 // ── 探针 ──────────────────────────────────────────────────────────
@@ -700,11 +749,13 @@ export function parseJsonc(text) {
   // 去掉 UTF-8 BOM（记事本/PowerShell 保存时常会带上，会导致 JSON.parse 报错）
   if (text && text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   text = String(text || '');
+  // 注释一律替换成等长空白（而不是直接删掉），这样 JSON.parse 报出的 position
+  // 才能对应回原文件的行列 —— 用户改配置写错时能精确指出第几行第几列。
   let out = '', inStr = false, inLine = false, inBlock = false, esc = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i], n = text[i + 1];
-    if (inLine) { if (c === '\n') { inLine = false; out += c; } continue; }
-    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++; } continue; }
+    if (inLine) { if (c === '\n') { inLine = false; out += c; } else out += ' '; continue; }
+    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; out += '  '; i++; } else out += (c === '\n' ? '\n' : ' '); continue; }
     if (inStr) {
       out += c;
       if (esc) { esc = false; continue; }
@@ -713,12 +764,12 @@ export function parseJsonc(text) {
       continue;
     }
     if (c === '"') { inStr = true; out += c; continue; }
-    if (c === '/' && n === '/') { inLine = true; i++; continue; }
-    if (c === '/' && n === '*') { inBlock = true; i++; continue; }
+    if (c === '/' && n === '/') { inLine = true; out += '  '; i++; continue; }
+    if (c === '/' && n === '*') { inBlock = true; out += '  '; i++; continue; }
     out += c;
   }
-  // 顺手干掉对象/数组结尾多余逗号
-  out = out.replace(/,(\s*[}\]])/g, '$1');
+  // 顺手干掉对象/数组结尾多余逗号（同样用空白顶替，保持偏移量）
+  out = out.replace(/,\s*([}\]])/g, (m) => ' ' + m.slice(1));
   return JSON.parse(out);
 }
 

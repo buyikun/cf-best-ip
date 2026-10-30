@@ -23,7 +23,7 @@
 |---|---|
 | `apiToken` | dash.cloudflare.com → 头像 → My Profile → API Tokens → 权限选 `Zone → DNS → Edit` |
 | `zoneId` | dash.cloudflare.com 点进该域名 → 右下角 Overview 面板里的 Zone ID |
-| `records` | 改成你自己的子域名（例如 `sub.你的域名.com`），条数随意 |
+| `domains` | 改成你自己的子域名（例如 `sub.你的域名.com`），条数随意，逗号分隔 |
 
 > **不填也能跑**：程序会自动进入**演示模式**——只测速、打印方案，几十秒出结果，绝不碰你的 DNS。
 > 想先看效果，直接做第 3 步。
@@ -149,7 +149,7 @@ var\                                        ← 运行产物，删了也不影�
   几十秒就结束，不会碰他的 DNS —— 先看到效果，再去填配置
 
 ⚠️ **发出去之前务必清空你自己的凭据**：把 `user.config.jsonc` 里的 `apiToken`、`zoneId` 清空
-（`records` 改成 `example.com` 之类的占位值），或者干脆删掉这个文件（程序会自动走演示模式）。
+（`domains` 改成 `example.com` 之类的占位值），或者干脆删掉这个文件（程序会自动走演示模式）。
 `var\` 目录里可能含有你的域名和 IP 记录，也建议一并删掉再打包。
 
 对方拿到后的三步：**装 Node.js → 填 `user.config.jsonc` → 双击 `run-fast.cmd`**。
@@ -158,17 +158,44 @@ var\                                        ← 运行产物，删了也不影�
 
 **`user.config.jsonc`** 是给你填写的变量文件（JSONC 格式，支持 `//` 和 `/* */` 注释，字段旁边全都有中文说明）：
 
-- Cloudflare 的 `apiToken` / `zoneId` / 要替换的 `records`（域名列表）
+- Cloudflare 的 `apiToken` / `zoneId` / 要替换的 `domains`（域名列表）
 - 达标线 `targetMbps`、写入数量 `uploadCount`、订阅源 `source.urls` 等常用项
+
+最简写法就是填好 `domains`，其余一行都不用动：
+
+```jsonc
+"cloudflare": {
+  "apiToken": "你的Token",
+  "zoneId": "你的ZoneID",
+  "domains": ["a.你的域名.com", "b.你的域名.com"]
+}
+```
+
+`ttl` / `proxied` / `topN` 这些通用设置放在 `defaults` 段里，默认值即可正常使用。
 
 两条硬规则：
 
-1. **不填就不上传**：`apiToken`、`zoneId`、`records` 任意一项为空（`""` 或 `[]`），
+1. **不填就不上传**：`apiToken`、`zoneId`、`domains` 任意一项为空（`""` 或 `[]`），
    脚本就只做测速、打印方案，**绝不调用 Cloudflare 写接口**（日志会明确写"只测速模式"）。
    想临时彻底停掉上传，把 `apiToken` 清空即可；或者在 `behavior.dryRun` 填 `true`。
 2. **凭据只认这个文件**：`cfip.config.json` 里的 `cloudflare` 段只是占位，填什么都没用。
 
 没写在 `user.config.jsonc` 里的项，会自动回退用 `cfip.config.json` 的内置默认值。
+
+### 只想用某些国家的节点？
+
+在 `defaults` 里加一行 `filter`（不需要筛选就保持 `tokens: []`）：
+
+```jsonc
+"filter": { "mode": "allow", "tokens": ["HK", "SG", "JP"] }   // 只用 香港/新加坡/日本
+"filter": { "mode": "deny",  "tokens": ["JP", "KR"] }         // 排除 日本和韩国
+```
+
+`tokens` 是**数组，多个国家就在里面加多项、逗号分隔**，大小写随意（程序自动转大写）。
+国家码就是订阅文件里 `#` 后面那两位，完整列表见 `user.config.jsonc.example` 末尾「七、国家码是什么」。
+
+> 安全设计：如果 `allow` 筛完是 0 个节点（比如国家码笔误写成 `SGP`），
+> 程序会跳过该域名并打出警告，**不会把该域名的 DNS 记录清空**。
 
 > ⚠️ `user.config.jsonc` 含明文 Token，别截图外发、别提交到公开仓库。
 
@@ -277,17 +304,24 @@ var\                                        ← 运行产物，删了也不影�
 
 ```jsonc
 "urls": [
-  { "url": "https://api.uouin.com/cloudflare.html", "tier": "fresh",  "name": "麒麟优选" },
-  { "url": "https://cf.junzhen.qzz.io/full_ips.txt", "tier": "fresh",  "name": "junzhen四川联通" },
-  { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" },
-  { "url": "https://raw.githubusercontent.com/HandsomeMJZ/cfip/...", "tier": "legacy", "name": "GitHub主源" }
+  { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/xinyitang3/ipv4.txt", "tier": "fresh", "name": "Mia优选" },
+  { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/tiancheng/all.txt",   "tier": "fresh", "name": "天诚优选1" },
+  { "url": "https://api.uouin.com/cloudflare.html",                                     "tier": "fresh", "name": "麒麟优选" },
+  { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt",                                 "tier": "fresh", "name": "junzhen北京电信" }
 ]
 ```
 
 **两种格式都能解析**：
 - 纯文本订阅（`1.2.3.4:443#JP [7M]`、`1.2.3.4:443#JP [45ms 12Mbps]`）
 - **HTML 表格**（如麒麟优选 `api.uouin.com/cloudflare.html`，自动识别 `序号/运营商/IP/丢包率` 四列）
-  运营商会映射成 `TEL/UNI/CMB` 存进 `cc` 字段，所以国家码过滤也能用
+  运营商会映射成 `TEL/UNI/CMB/MUL` 存进 `cc` 字段，所以国家码过滤也能用
+
+**国家码写在哪儿都行**：有些源的写法是 `1.2.3.4:443#某优选 | 港岛茶记 | HK | ...`，
+国家码并不紧贴 `#`。程序会从 `#` 后面的整段文字里按国家码白名单挑出来
+（连个别源为了防止被脚本抓取而插入的零宽空格混淆也能识破）。
+
+**只保留 443 端口的节点**：DNS 的 A 记录只能填 IP、不能填端口，所以源里
+`:8443`、`:2087`、`:11371` 这类非 443 端口的条目会被自动丢弃，绝不会写进你的 DNS。
 
 ### 数据源按「历史表现」动态分级
 

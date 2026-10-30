@@ -453,8 +453,20 @@ try {
   });
   log('---- 上传方案 ----');
   for (const p of plan) log(`   ${p.rec.name} <- ${p.ips.join(', ') || '(空)'}`);
-  let changed = false;
+  // 【安全护栏】筛选结果为 0 个节点时，绝不参与写入。
+  //   否则 toAdd 为空、toDelete 为全部现有记录 → 会把该域名的 A 记录清空。
+  //   典型误配：filter.mode="allow" 但国家码拼错（如写成 SGP 而不是 SG）。
+  const blocked = [];
+  const actionable = [];
   for (const p of plan) {
+    if (p.ips.length === 0) { p.next = []; p.same = true; blocked.push(p); }
+    else actionable.push(p);
+  }
+  for (const p of blocked) {
+    log(`   ⚠ ${p.rec.name}：按 filter 筛选后 0 个节点，已跳过该域名（不会清空现有记录）`);
+  }
+  let changed = false;
+  for (const p of actionable) {
     const cur = current.filter(r => r.name === p.rec.name && r.type === p.rec.type).map(r => r.content).sort();
     const next = [...p.ips].sort();
     p.next = next; p.same = cur.length === next.length && cur.every((v, i) => v === next[i]);
@@ -484,7 +496,7 @@ try {
   if (!changed && cfg.behavior.skipIfUnchanged && !flag('--force')) {
     log('结论：已是最优集合，跳过写入。');
     saveHistory(finalRanked);
-    writeJson(STATE_FILE, { lastRunAt: new Date().toISOString(), mode: 'fast', networkKey: net.key, skipped: true, target, plan: plan.map(p => ({ name: p.rec.name, ips: p.next })) });
+    writeJson(STATE_FILE, { lastRunAt: new Date().toISOString(), mode: 'fast', networkKey: net.key, skipped: true, target, plan: actionable.map(p => ({ name: p.rec.name, ips: p.next })) });
     throw new ExitError(0);
   }
   // 质量保护：本次明显不如上次时不要替换
@@ -499,7 +511,7 @@ try {
   if (DRY) throw new Error('内部保护：dry-run 状态下不应进入写入流程');
 
   // 8. 备份 + 写入
-  const targets = flag('--force') ? plan : plan.filter(p => !p.same);
+  const targets = flag('--force') ? actionable : actionable.filter(p => !p.same);
   const failed = [];          // 写入失败的记录（不中断整体流程）
   if (cfg.behavior.backupBeforeWrite) {
     const bak = path.join(BAK_DIR, `cf-backup-${RUN_ID}.json`);
@@ -545,7 +557,7 @@ try {
   log('---- 验证 ----');
   const after = await cf.list();
   let allOk = true;
-  for (const p of plan) {
+  for (const p of actionable) {
     const got = after.filter(r => r.name === p.rec.name && r.type === p.rec.type).map(r => r.content).sort();
     const ok = got.length === p.next.length && got.every((v, i) => v === p.next[i]);
     if (!ok) allOk = false;
