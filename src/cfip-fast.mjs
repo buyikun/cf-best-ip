@@ -24,7 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createLogger, loadSource, download, downloadTimed, quickProbe, pool, median,
-  createCf, dohCheck, applyFilter, readJson, writeJson,
+  createCf, dohCheck, applyFilter, readJson, writeJson, relinkCheckRetry,
   measureLocalBandwidth, getNetworkProfile, readProfileStore, saveProfileStore, pruneOldFiles, loadConfig, findBaseDir
 } from './cfip-lib.mjs';
 
@@ -32,8 +32,28 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 // 根目录：配置文件与 var\ 运行目录所在的那一层（程序可以放在 src\ 子目录里）
 const BASE = findBaseDir(HERE);
 const argv = process.argv.slice(2);
-const flag = n => argv.includes(n);
-const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
+// 参数识别：既认 `--dry-run`，也认 `--dry-run=true` / `--dry-run=1`。
+//   （以前只用 argv.includes('--dry-run')，写成 --dry-run=true 会被当成没开 dry-run，
+//     于是本该只演算的调试运行真的去改 DNS 了 —— 这是必须堵死的坑。）
+const flag = n => argv.some(a => a === n || a === `${n}=true` || a === `${n}=1`);
+const opt = (n, d) => {
+  const i = argv.indexOf(n);
+  if (i >= 0 && argv[i + 1]) return argv[i + 1];
+  const kv = argv.find(a => a.startsWith(`${n}=`));
+  return kv ? kv.slice(n.length + 1) : d;
+};
+// 数值参数统一过一遍：非数字或非法值直接报错退出，不要带着 NaN 往下跑
+//   否则 --probe abc 会让 slice(0, NaN) 返回空数组，报出「无可用节点」这种误导性的错误。
+const optNum = (n, d, min = 1, max = 1e9) => {
+  const raw = opt(n);
+  if (raw === undefined) return d;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < min || v > max) {
+    console.error(`参数 ${n} 的值「${raw}」不合法，应为 ${min}~${max} 之间的数字`);
+    process.exit(2);
+  }
+  return v;
+};
 
 const CONFIG_PATH = path.resolve(HERE, opt('--config', 'cfip.config.json'));   // 内置默认配置随程序在 src\
 const USER_CONFIG_PATH = path.resolve(BASE, opt('--user-config', 'user.config.jsonc'));  // 用户配置在根目录
@@ -43,7 +63,7 @@ const DRY = flag('--dry-run') || cfg.behavior.dryRun === true;
 const F = {
   targetRatio: 0.6667, floorMbps: 2, targetCount: 10, minProbe: 60, uploadCount: 3,
   maxProbe: 80, probeConcurrency: 1, probeBytes: 1048576, probeTimeoutMs: 2500,
-  verifyRounds: 2, maxSeconds: 300, historyFile: 'var/history.json', historyTtlHours: 12,
+  verifyRounds: 2, maxSeconds: 480, historyFile: 'var/history.json', historyTtlHours: 12,
   bandwidthCacheFile: 'var/bandwidth.json', bandwidthCacheHours: 24, bandwidthSeconds: 4,
   targetMbps: 0, targetTtlDays: 30, healthCheck: true, qualityGuard: true, guardRatio: 0.5,
   fallbackAfterProbes: 30, localBandwidthMbps: 0,
@@ -52,9 +72,9 @@ const F = {
   sourceStatFile: 'var/source-stats.json', sourceStatTtlDays: 14, sourceStatWarmup: 30,
   ...(cfg.fast || {})
 };
-if (opt('--target')) F.targetMbps = Number(opt('--target'));
-if (opt('--ratio')) F.targetRatio = Number(opt('--ratio'));
-if (opt('--probe')) F.maxProbe = Number(opt('--probe'));
+if (opt('--target')) F.targetMbps = optNum('--target', F.targetMbps, 0.1, 10000);
+if (opt('--ratio')) F.targetRatio = optNum('--ratio', F.targetRatio, 0.05, 1);
+if (opt('--probe')) F.maxProbe = optNum('--probe', F.maxProbe, 1, 100000);
 if (flag('--skip-health')) F.healthCheck = false;
 
 const CFG_DIR = BASE;
@@ -188,12 +208,19 @@ try {
   log(`达标线：${target}Mbps（${targetSrc}）`);
 
   // 3. 现状体检：DNS 里正在用的 IP 达标就不折腾（快速模式的初衷：可用即可）
+  //    healthAllDead：现有 IP 全部不通/不达标 → 站点此刻处于打不开状态。
+  //    后面若 filter 把候选筛成 0 个，就要降级「放弃 filter、优先保可用」，
+  //    否则会跳过写入，让站点继续宕机（2026-11-06 真实踩过这个坑）。
+  //    另外：DNS 里此刻没有任何 A 记录时，站点同样打不开，也按"已宕机"处理。
+  let healthAllDead = uploadReady && curIps.length === 0;
+  if (healthAllDead) log('   ⚠ 当前 DNS 没有任何 A 记录 —— 站点是打不开的，本次以「先恢复可用」为第一优先');
+  let goodNow = [];   // 体检中达标的现役 IP（后面补齐数量时要优先保留它们）
   if (F.healthCheck && curIps.length) {
     log('---- 现状体检 ----');
     const healthRounds = Math.max(1, Number(F.healthRounds ?? 2));
     // 升级为「固定时长稳态测速」：每节点跑 2.5 秒，剥离 0.8s 慢启动
     // 慢节点绝不死等（2.5s 硬掐断），快节点拉满稳态带宽，精准判断现有 IP 是否真正合格
-    const good = [];
+    const good = goodNow;
     for (const ip of curIps) {
       const samples = [];
       for (let r = 0; r < healthRounds; r++) {
@@ -205,8 +232,14 @@ try {
       log(`   ${ip.padEnd(16)} ${shown.padEnd(12)} ${healthRounds > 1 ? `(${healthRounds} 次取最好) ` : ''}${ok ? '✔ 达标' : '✘ 不达标'}`);
       if (ok) good.push({ ip, mbps: best.mbps, ttfb: best.ttfb, cc: fresh[ip]?.cc || '' });
     }
-    const need = Math.min(F.uploadCount, curIps.length);
-    if (good.length >= need) {
+    // 【要凑够数量，不能按现有条数打折扣】
+    //   以前是 Math.min(uploadCount, curIps.length)：DNS 里只有 3 条时门槛就降成 3，
+    //   3 个达标就收工 —— 结果永远补不到 uploadCount 个。
+    //   现在要求「达标数」和「记录数」都够 uploadCount 才算收工，否则去优选补齐。
+    const need = Math.max(1, Number(F.uploadCount ?? 3));
+    const enoughCount = good.length >= need;
+    const enoughRecords = curIps.length >= need;
+    if (enoughCount && enoughRecords) {
       log(`结论：现有 ${good.length}/${curIps.length} 个 IP 仍达标，无需重新优选。`);
       saveHistory(good.sort((a, b) => b.mbps - a.mbps));
       writeJson(STATE_FILE, {
@@ -215,7 +248,13 @@ try {
       });
       throw new ExitError(0);
     }
-    log(`   仅 ${good.length} 个仍达标（需要 ${need} 个），进入重新优选`);
+    if (!enoughCount) {
+      log(`   仅 ${good.length} 个仍达标（需要 ${need} 个），进入重新优选`);
+    } else {
+      log(`   达标的 ${good.length} 个够了，但 DNS 里只有 ${curIps.length} 条记录（想要 ${need} 条），进入优选补齐`);
+    }
+    healthAllDead = good.length === 0;
+    if (healthAllDead) log('   ⚠ 现有 IP 全部不通/不达标 —— 站点此刻是打不开的，本次以「先恢复可用」为第一优先');
   }
 
   // 4. 拉源 + 按「数据源历史表现」动态排序
@@ -246,19 +285,51 @@ try {
     // 平滑命中率为主（权重 1.0），速度微调（最多 +0.2），整体乘 tier 底色
     return +(base * (0.4 + smoothed * 1.2 + speedFactor * 0.2)).toFixed(3);
   }
+  // 【前置排除：filter 用不上的节点，测速前就剔掉，不浪费精测时间】
+  //   出方案时是按每个域名的 filter 筛的，凡是被所有域名都排除掉的节点，
+  //   实测多少都快都没用 —— 测了也是白测。
+  //   判定用并集：只要某个域名的 filter 想要它，就保留。
+  //   （某域名 filter 为空 tokens = 不筛选 = 全都要，此时等于不排除，行为同以前。）
+  const wantedByAny = (cc) => {
+    const c = String(cc || '').toUpperCase();
+    for (const rec of (cfg.cloudflare.records || [])) {
+      const f = rec.filter;
+      if (!f || !f.tokens || f.tokens.length === 0) return true;   // 有条记录不限国家 = 全都想要
+      const set = new Set(f.tokens.map(t => String(t).toUpperCase()));
+      const mode = String(f.mode || 'deny').toLowerCase();
+      if (mode === 'allow' ? set.has(c) : !set.has(c)) return true;
+    }
+    return false;
+  };
   // 给每个节点打上所属源的优先级分数
-  const withScore = all.map(r => {
+  const withScoreAll = all.map(r => {
     const label = r.sourceLabel || r.tier || 'unknown';
-    return { ...r, srcLabel: label, srcScore: scoreOf(label, r.tier) };
+    return { ...r, srcLabel: label, srcScore: scoreOf(label, r.tier), wanted: wantedByAny(r.cc) ? 1 : 0 };
   });
+  // 【安全阀】filter 一个都没命中时绝不照做 —— 那会让本轮没有任何候选，
+  //   上游换个写法、或国家码拼错，就可能导致站点彻底没有可用 IP（11-06 踩过）。
+  const minFilterKeep = Math.max(1, Number(F.minFilterKeep ?? 5));
+  const wantedTotal = withScoreAll.filter(r => r.wanted).length;
+  let withScore = withScoreAll;
+  if (wantedTotal >= minFilterKeep) {
+    withScore = withScoreAll.filter(r => r.wanted);
+    log(`候选池：源里 ${withScoreAll.length} 个 → 按 filter 前置排除掉 ${withScoreAll.length - wantedTotal} 个必然用不上的节点，只测 ${withScore.length} 个`);
+  } else if (wantedTotal > 0) {
+    log(`⚠ filter 只命中 ${wantedTotal} 个（少于安全值 ${minFilterKeep}），本次不做前置排除，回退测全部 ${withScoreAll.length} 个`);
+  } else {
+    log(`⚠ filter 没有命中任何节点（国家码可能拼错了）—— 为避免本轮无候选，回退测全部 ${withScoreAll.length} 个`);
+  }
 
   // 排序：历史实测过的活节点最优先 → 源分数高的优先
   // （不参考标称速度：实测与实际毫无相关性，只会引入噪声）
-  const histRanked = withScore.filter(r => fresh[r.ip]).sort((a, b) => fresh[b.ip].mbps - fresh[a.ip].mbps);
+  const histRanked = withScore.filter(r => fresh[r.ip])
+    .sort((a, b) => (fresh[b.ip].mbps - fresh[a.ip].mbps));
   const histIps = new Set(histRanked.map(r => r.ip));
   const restAll = withScore.filter(r => !histIps.has(r.ip) && r.port === P)
-    .sort((a, b) => b.srcScore - a.srcScore);
-  const curRanked = curIps.map(ip => withScore.find(r => r.ip === ip) || { ip, port: P, cc: '', fileMs: 0, fileMbps: 0, srcLabel: '(现用)', srcScore: 9 });
+    .sort((a, b) => (b.srcScore - a.srcScore));
+  // 现役 IP 不参与前置排除：它们是 DNS 里正在用的，体检已判过，
+  //   达标的话早在体检分支就收工了，走到这里说明需要补齐或替换。
+  const curRanked = curIps.map(ip => withScoreAll.find(r => r.ip === ip) || { ip, port: P, cc: '', fileMs: 0, fileMbps: 0, srcLabel: '(现用)', srcScore: 9 });
   const seenIp = new Set();
   const queue = [...curRanked, ...histRanked, ...restAll]
     .filter(r => (seenIp.has(r.ip) ? false : (seenIp.add(r.ip), true)))
@@ -267,16 +338,18 @@ try {
 
   // 打印源优先级，方便观察分级是否合理
   const bySrc = {};
-  for (const r of withScore) {
+  for (const r of withScoreAll) {   // 用全量源统计，但标注哪些被前置排除
     const k = r.srcLabel;
-    (bySrc[k] ||= { n: 0, score: r.srcScore, tier: r.tier });
+    (bySrc[k] ||= { n: 0, score: r.srcScore, tier: r.tier, kept: 0 });
     bySrc[k].n++;
+    if (r.wanted) bySrc[k].kept++;
   }
   log('---- 数据源优先级（历史表现 + 新鲜度）----');
   Object.entries(bySrc).sort((a, b) => b[1].score - a[1].score).forEach(([k, v]) => {
     const s = srcStats[k];
     const hist = s ? `  上次: 测${s.tested}中${s.hit}达标 均速${(s.avgMbps || 0).toFixed(1)}Mbps` : '  (暂无历史)';
-    log(`   ${v.score.toFixed(2)}  ${k.padEnd(28)} ${String(v.n).padStart(4)}个${hist}`);
+    const keep = withScore === withScoreAll ? `${String(v.n).padStart(4)}个` : `${String(v.kept).padStart(4)}/${String(v.n).padStart(4)}个`;
+    log(`   ${v.score.toFixed(2)}  ${k.padEnd(28)} ${keep}${hist}`);
   });
   log(`候选队列：${queue.length} 个（按源优先级排序测试）`);
 
@@ -399,7 +472,11 @@ try {
 
   // 6. 优中选优
   let candidateList = collected.slice();
-  const wantMin = Math.max(F.uploadCount * 2, F.targetCount);
+  // 【复核名额要留够余量】复核结果是「已达标节点」里再取前 wantMin 名，
+  //   但后面还要按每个域名的 filter 再筛一遍。filter 收紧（比如只留港/新/韩）时，
+  //   复核结果里往往只有一两个符合 —— 名额太少就会"筛完不够数"。
+  //   所以按 uploadCount 的 3 倍起步，且不低于 targetCount。
+  const wantMin = Math.max(F.uploadCount * 3, F.targetCount);
   if (candidateList.length < wantMin) {
     const have = new Set(candidateList.map(x => x.ip));
     const extras = [...tested.entries()]
@@ -429,30 +506,97 @@ try {
     }
   }
   // 最终排名用大样本复核结果，并以真实速度重新判定达标
+  // 排序：直接按实测速度从快到慢（延迟只作为并列时的次键，不参与主要排序）
   const ranked = finalists.map(c => {
     const ok = (c.samples || []).filter(s => s.ok);
-    return { ...c, mbps: median(ok.map(s => s.mbps)) || c.mbps, ttfb: median(ok.map(s => s.ttfb)) || c.ttfb, okRate: ok.length / Math.max(1, (c.samples || []).length) };
+    // colo 取自复核样本里最常见的那一个（anycast 可能换落点，取众数比取最后一次更稳）
+    const coloCount = {};
+    for (const s of ok) if (s.colo) coloCount[s.colo] = (coloCount[s.colo] || 0) + 1;
+    const colo = Object.keys(coloCount).sort((a, b) => coloCount[b] - coloCount[a])[0] || '';
+    return { ...c, colo, mbps: median(ok.map(s => s.mbps)) || c.mbps, ttfb: median(ok.map(s => s.ttfb)) || c.ttfb, okRate: ok.length / Math.max(1, (c.samples || []).length) };
   }).filter(r => r.okRate >= 0.5)
     .sort((a, b) => b.mbps - a.mbps || a.ttfb - b.ttfb);
 
   const passed = ranked.filter(r => r.mbps >= target);
-  log('---- 复核排名（大样本实测，仅供参考）----');
+  log('---- 复核排名（按实测速度）----');
   for (const r of ranked) {
     const mark = r.mbps >= target ? '✔ 达标' : `✘ 低于${target}`;
-    log(`   ${r.ip.padEnd(16)} ${r.cc} ${String(r.mbps).padStart(7)}Mbps  ttfb=${r.ttfb}ms  ${mark}`);
+    const colo = r.colo ? ` ${String(r.colo).padEnd(4)}` : '';
+    log(`   ${r.ip.padEnd(16)} ${String(r.cc).padEnd(4)}${colo} ${String(r.mbps).padStart(7)}Mbps  ttfb=${String(r.ttfb).padStart(4)}ms  ${mark}`);
   }
   log(`复核结论：${passed.length}/${ranked.length} 个真实达标（≥${target}Mbps）`);
   if (!passed.length) throw new Error(`复核后没有节点达到 ${target}Mbps，保留现有 DNS 记录不变`);
   // 后续方案只用真正达标的节点
   const finalRanked = passed;
   // 7. 方案 + 比对（只用真实达标的节点）
-  const plan = (cfg.cloudflare.records || []).map(rec => {
+  //    【降级兜底】如果现有 IP 全挂了（站点打不开），而 filter 又把这个域名筛成 0 个节点，
+  //    那"守 filter"的代价是站点继续宕机 —— 此时放弃 filter，先恢复可用。
+  //    这正是快速模式的初衷：「我目的是可用，而不是最好用」。
+  //
+  //    【链路复验 relink】测速打的是 speed.cloudflare.com，跟你自己的域名通不通是两回事。
+  //    实测遇到过「测速 20+Mbps、但换成真实域名直接 ECONNRESET」的节点。
+  //    所以写 DNS 之前，用「域名本身」做 SNI + Host 打一次真实请求，打不开的直接剔除。
+  //    这是最后一道闸，宁可少写几个 IP，也不要把打不开的 IP 写进去。
+  const relinkCache = new Map();      // `${domain}|${ip}` → relinkCheck 结果，同一个 IP 只测一次
+  const relinkOne = async (domain, ip) => {
+    const key = `${domain}|${ip}`;
+    if (!relinkCache.has(key)) relinkCache.set(key, await relinkCheckRetry(ip, domain, 3));
+    return relinkCache.get(key);
+  };
+  const relinkDead = [];
+  let relinkTried = 0;
+  const plan = [];
+  for (const rec of (cfg.cloudflare.records || [])) {
     const limit = Math.min(rec.topN ?? F.uploadCount, F.uploadCount);
-    const picked = applyFilter(finalRanked, rec.filter).slice(0, limit);
-    return { rec, detail: picked, ips: picked.map(r => r.ip) };
-  });
+    let candidates = applyFilter(finalRanked, rec.filter);
+    let relaxed = false;
+    if (candidates.length === 0 && healthAllDead) {
+      candidates = finalRanked.slice();
+      relaxed = true;
+    }
+    // 逐个做链路复验，凑够 limit 个就停；最多试 limit*4 个，避免大量打不开的节点拖长耗时
+    const picked = [];
+    const triedIps = new Set();
+    const maxTry = Math.min(candidates.length, Math.max(limit * 4, limit + 5));
+    for (const cand of candidates) {
+      if (picked.length >= limit || triedIps.size >= maxTry) break;
+      triedIps.add(cand.ip);
+      relinkTried++;
+      const rr = await relinkOne(rec.name, cand.ip);
+      if (rr.ok) picked.push({ ...cand, relinkColo: rr.colo });
+      else relinkDead.push({ name: rec.name, ip: cand.ip, err: rr.err || ('HTTP ' + rr.code) });
+    }
+    // 【保住现役能用的】只是「数量不够、要补齐」时（healthAllDead=false），
+    //   现役达标的 IP 优先占位，只用新优选的补足空额，
+    //   避免为了凑够 5 个而把正在正常工作的 3 个也一起换掉。
+    let keptInUse = [];
+    if (!relaxed && !healthAllDead && goodNow.length) {
+      const pickedIps = new Set(picked.map(r => r.ip));
+      keptInUse = goodNow.filter(g => !pickedIps.has(g.ip));
+      if (keptInUse.length) {
+        const room = Math.max(0, limit - picked.length);
+        const keep = keptInUse.slice(0, room);
+        picked.push(...keep);
+        keptInUse = keep;
+      } else {
+        keptInUse = [];
+      }
+    }
+    plan.push({ rec, detail: picked, ips: picked.map(r => r.ip), relaxed, keptInUse });
+  }
+  if (relinkTried) {
+    log(`---- 链路复验：试了 ${relinkTried} 次，剔除 ${relinkDead.length} 个「测速能过、但你的域名打不开」的节点 ----`);
+    for (const d of relinkDead) log(`   ✘ ${d.ip.padEnd(16)} ${d.name} → ${d.err}`);
+    if (!relinkDead.length) log('   ✔ 全部通过，没有需要剔除的节点');
+  }
   log('---- 上传方案 ----');
-  for (const p of plan) log(`   ${p.rec.name} <- ${p.ips.join(', ') || '(空)'}`);
+  for (const p of plan) {
+    const tail = p.relaxed ? '  ← 已暂时忽略 filter（先恢复可用）' : '';
+    log(`   ${p.rec.name} <- ${p.ips.join(', ') || '(空)'}${tail}`);
+    if (p.keptInUse?.length) {
+      log(`      （其中 ${p.keptInUse.map(g => g.ip).join(', ')} 是现役可用、本次保留）`);
+    }
+  }
   // 【安全护栏】筛选结果为 0 个节点时，绝不参与写入。
   //   否则 toAdd 为空、toDelete 为全部现有记录 → 会把该域名的 A 记录清空。
   //   典型误配：filter.mode="allow" 但国家码拼错（如写成 SGP 而不是 SG）。
@@ -494,7 +638,18 @@ try {
     throw new ExitError(0);
   }
   if (!changed && cfg.behavior.skipIfUnchanged && !flag('--force')) {
-    log('结论：已是最优集合，跳过写入。');
+    // 【提示要如实】不能笼统说「已是最优集合」：
+    //   若域名全被 filter 筛成 0 个节点，真实情况是「没有可选 IP、现有记录可能已失效」，
+    //   说成「最优」会让用户以为一切正常，而站点实际可能已经打不开。
+    if (actionable.length === 0 && blocked.length > 0) {
+      log('结论：本次没有可写入的节点，DNS 记录保持不变。');
+      log('   ⚠ 上面列出的域名都被 filter 筛成了 0 个节点 —— 现有记录若已不可用，站点就会打不开。');
+      log('   建议放宽 filter（改成 "mode": "deny" 且 tokens 留空即不限国家），详见 user.config.jsonc 里的注释。');
+    } else if (blocked.length > 0) {
+      log(`结论：可更新的 ${actionable.length} 个域名已是最优集合，跳过写入（另有 ${blocked.length} 个域名被 filter 筛成 0 个节点）。`);
+    } else {
+      log('结论：已是最优集合，跳过写入。');
+    }
     saveHistory(finalRanked);
     writeJson(STATE_FILE, { lastRunAt: new Date().toISOString(), mode: 'fast', networkKey: net.key, skipped: true, target, plan: actionable.map(p => ({ name: p.rec.name, ips: p.next })) });
     throw new ExitError(0);

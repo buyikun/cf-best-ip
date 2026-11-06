@@ -202,9 +202,25 @@ export async function loadSource(sourceCfg, cfgDir, log) {
       const tier = (typeof entry === 'object' && entry.tier) || 'fresh';
       const label = (typeof entry === 'object' && entry.name) || '';
       if (!u) continue;
-      const txt = await httpGet(u);
+      // 拉取单个源，失败自动重试。
+      //   为什么必须重试：raw.githubusercontent.com 实测存在偶发失败
+      //   （同一个 URL 第一次 HTTP 000、紧接着两次都 200）。
+      //   以前只拉一次，一次抖动就把整个源丢掉，而丢掉的往往是命中率最高的源。
+      let txt = '';
+      const tries = Math.max(1, Number(s.fetchRetries ?? 3));
+      for (let i = 0; i < tries; i++) {
+        txt = await httpGet(u);
+        if (txt) break;
+        if (i < tries - 1) {
+          log(`   源拉取失败，${i + 1}/${tries} 次重试中：${u}`);
+          await new Promise(r => setTimeout(r, 800 * (i + 1)));
+        }
+      }
       const rowsAll = txt ? parseAny(txt) : [];       // 自动兼容 HTML 表格与纯文本订阅
-      if (!rowsAll.length) { log(`   源不可用或解析为空，跳过：${u}`); if (s.merge) continue; else break; }
+      if (!rowsAll.length) {
+        log(`   源不可用或解析为空（已试 ${tries} 次），跳过：${u}`);
+        if (s.merge) continue; else break;
+      }
       // DNS 的 A 记录只能写 IP、不能写端口，用户访问默认走 443。
       // 所以只保留 443 端口的节点；其余端口（8443/2087/11371…）写进 DNS 也访问不通。
       const rows = rowsAll.filter(r => r.port === 443);
@@ -282,14 +298,14 @@ export function download(ip, port, bytes, timeout, onProgress) {
   return new Promise(resolve => {
     const t0 = Date.now();
     let ttfb = 0, got = 0, done = false, guard = null;
-    let lastTick = 0;
+    let lastTick = 0, colo = '';
     const fin = (ok, err) => {
       if (done) return; done = true;
       if (guard) clearTimeout(guard);
       try { req && req.destroy(); } catch { /* 忽略 */ }
       const total = Date.now() - t0;
       const mbps = ok && total - ttfb > 0 ? (got * 8) / ((total - ttfb) / 1000) / 1e6 : 0;
-      resolve({ ok, mbps: +mbps.toFixed(2), ttfb: ok ? ttfb : 0, total, got, err: err || '' });
+      resolve({ ok, mbps: +mbps.toFixed(2), ttfb: ok ? ttfb : 0, total, got, colo, err: err || '' });
     };
     const req = https.request({
       host: ip, port, path: `/__down?bytes=${bytes}`, method: 'GET',
@@ -302,6 +318,9 @@ export function download(ip, port, bytes, timeout, onProgress) {
       // 2. 严查是否为真实的 Cloudflare 边缘节点，过滤伪装/默认网页主机（如只返回几KB html 却算成上百Mbps的假节点）
       const server = String(res.headers['server'] || '').toLowerCase();
       const hasCfRay = !!res.headers['cf-ray'];
+      // 从 cf-ray 尾部取三位 IATA 码，即流量真实落点的数据中心（colo）。
+      // 订阅源标注的国家码与真实落点常常不一致，colo 才是可信的实测归因。
+      colo = String(res.headers['cf-ray'] || '').split('-').pop() || '';
       const cType = String(res.headers['content-type'] || '').toLowerCase();
       if (!server.includes('cloudflare') && !hasCfRay) {
         res.resume();
@@ -349,7 +368,7 @@ export function download(ip, port, bytes, timeout, onProgress) {
 export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8, onProgress = null) {
   return new Promise(resolve => {
     const t0 = Date.now();
-    let ttfb = 0, got = 0, done = false, timer = null, guardTimer = null;
+    let ttfb = 0, got = 0, done = false, timer = null, guardTimer = null, colo = '';
     const timeline = [];
 
     const fin = (ok, err = '') => {
@@ -361,7 +380,7 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
 
       const totalMs = Date.now() - t0;
       if (!ok) {
-        return resolve({ ok: false, err: err || 'failed', totalMs, ttfb, mbps: 0, steadyMbps: 0, got });
+        return resolve({ ok: false, err: err || 'failed', totalMs, ttfb, mbps: 0, steadyMbps: 0, got, colo });
       }
 
       // 剥离慢启动，计算稳态净速率
@@ -389,6 +408,7 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
         totalMs,
         ttfb,
         got,
+        colo,
         mbps: +steadyMbps.toFixed(2),       // 默认对外暴露的值即为稳态速度
         overallMbps: +overallMbps.toFixed(2),
         steadyMbps: +steadyMbps.toFixed(2),
@@ -406,6 +426,7 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
       if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
       const server = String(res.headers['server'] || '').toLowerCase();
       const hasCfRay = !!res.headers['cf-ray'];
+      colo = String(res.headers['cf-ray'] || '').split('-').pop() || '';
       const cType = String(res.headers['content-type'] || '').toLowerCase();
       if (!server.includes('cloudflare') && !hasCfRay) { res.resume(); return fin(false, '非CF节点'); }
       if (cType.includes('text/html')) { res.resume(); return fin(false, '返回HTML'); }
@@ -450,12 +471,12 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
 export function quickProbe(ip, port, bytes = 16384, timeout = 2500) {
   return new Promise(resolve => {
     const t0 = Date.now();
-    let ttfb = 0, got = 0, done = false, guard = null;
+    let ttfb = 0, got = 0, done = false, guard = null, colo = '';
     const fin = (ok, err) => {
       if (done) return; done = true;
       if (guard) clearTimeout(guard);
       try { req && req.destroy(); } catch { /* 忽略 */ }
-      resolve({ ok, ms: Date.now() - t0, ttfb: ok ? ttfb : 0, got, err: err || '' });
+      resolve({ ok, ms: Date.now() - t0, ttfb: ok ? ttfb : 0, got, colo, err: err || '' });
     };
     const req = https.request({
       host: ip, port, path: `/__down?bytes=${bytes}`, method: 'GET',
@@ -465,6 +486,7 @@ export function quickProbe(ip, port, bytes = 16384, timeout = 2500) {
       if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
       const server = String(res.headers['server'] || '').toLowerCase();
       const hasCfRay = !!res.headers['cf-ray'];
+      colo = String(res.headers['cf-ray'] || '').split('-').pop() || '';
       const cType = String(res.headers['content-type'] || '').toLowerCase();
       if (!server.includes('cloudflare') && !hasCfRay) { res.resume(); return fin(false, '非CF'); }
       if (cType.includes('text/html')) { res.resume(); return fin(false, 'HTML'); }
@@ -533,6 +555,83 @@ async function dohOnce(url) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 链路复验（relink）：用你自己的站点域名，真实访问一次候选 IP。
+ *
+ * 为什么需要它：测速阶段连的是 speed.cloudflare.com/__down，只能证明"这个 IP 能下载 CF 的测速文件"，
+ * 不能证明"它会把你的域名正确转发出去"。实测遇到过测速 20+Mbps、但换成你的域名直接 ECONNRESET 的节点。
+ * 所以写入 DNS 之前再验一次：TCP + TLS + HTTP，SNI 和 Host 都必须是你的域名。
+ *
+ * 判定为可用的条件：HTTP 200 且收到响应体。
+ *   - CF 对 Host 不匹配会返回 403/421，所以 Host 头必须一起带上（实战踩过：只给 SNI 会全部 403）。
+ *   - 允许 3xx/4xx？不。站点正常情况下就是 200，非 200 说明这条链路对你的域名不算"可用"。
+ *
+ * @param {string} ip      候选 IP
+ * @param {string} domain  你的站点域名（用来做 SNI 和 Host）
+ * @param {number} timeoutMs 单次超时
+ * @returns {Promise<{ok:boolean, code?:number, bytes?:number, colo?:string, ms:number, err?:string}>}
+ */
+export function relinkCheck(ip, domain, timeoutMs = 6000, port = 443) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    let settled = false;
+    let req = null;
+    const fin = v => {
+      if (settled) return;
+      settled = true;
+      try { req && req.destroy(); } catch { /* 忽略 */ }
+      resolve({ ...v, ms: Date.now() - t0 });
+    };
+    req = https.request({
+      host: ip, port, path: '/', method: 'GET',
+      servername: domain,
+      headers: { Host: domain, 'User-Agent': UA },
+      rejectUnauthorized: false,
+      timeout: timeoutMs
+    }, res => {
+      let n = 0;
+      res.on('data', c => { n += c.length; });
+      res.on('end', () => fin({
+        ok: res.statusCode === 200 && n > 0,
+        code: res.statusCode, bytes: n,
+        colo: String(res.headers['cf-ray'] || '').split('-').pop() || ''
+      }));
+      res.on('error', e => fin({ ok: false, err: e.code || e.message }));
+    });
+    req.on('error', e => fin({ ok: false, err: e.code || e.message }));
+    req.on('timeout', () => fin({ ok: false, err: 'timeout' }));
+    req.end();
+  });
+}
+
+/**
+ * 链路复验（带重试）—— 单次复验会因偶发抖动误杀好节点，所以默认试 3 次，任一次通过即算可用。
+ *
+ * 为什么必须重试：实测同一节点对同一域名的复验结果会在 HTTP 421 / 200 之间来回跳。
+ *   HTTP 421 Misdirected Request 是 CF 边缘偶发拒绝（TLS 会话复用或路由抖动），
+ *   不代表这个 IP 长期不可用。只测一次会把这类节点误判成坏的，
+ *   导致明明可用的节点被剔除、最后凑不够 topN。
+ *
+ * @param {string} ip        候选 IP
+ * @param {string} domain    你的站点域名
+ * @param {number} tries     最多尝试次数（默认 3）
+ * @param {number} timeoutMs 单次超时
+ * @returns {Promise<{ok:boolean, code?:number, bytes?:number, colo?:string, ms:number, err?:string, attempts:number}>}
+ */
+export async function relinkCheckRetry(ip, domain, tries = 3, timeoutMs = 6000, port = 443) {
+  const t0 = Date.now();
+  const n = Math.max(1, Number(tries) || 1);
+  let last = null;
+  const errs = [];
+  for (let i = 0; i < n; i++) {
+    const r = await relinkCheck(ip, domain, timeoutMs, port);
+    last = r;
+    if (r.ok) return { ...r, ms: Date.now() - t0, attempts: i + 1 };
+    errs.push(r.err || ('HTTP ' + r.code));
+  }
+  return { ...(last || { ok: false }), ok: false, ms: Date.now() - t0, attempts: n, err: errs.join(' / ') };
 }
 
 export async function dohCheck(name) {
@@ -664,7 +763,7 @@ export async function getNetworkProfile(log = console.log) {
   try {
     const t = await httpGet('http://myip.ipip.net', 5000);
     if (t) {
-      // 格式形如：当前 IP：153.37.136.250  来自于：中国 江苏 南通  chinaunicom.com
+      // 格式形如：当前 IP：203.0.113.5  来自于：中国 某省 某市  example.com
       const ipMatch = t.match(/(\d{1,3}(?:\.\d{1,3}){3})/);
       if (ipMatch) {
         info.ip = ipMatch[1];

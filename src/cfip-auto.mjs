@@ -17,13 +17,20 @@ import path from 'node:path';
 import net from 'node:net';
 import https from 'node:https';
 import { fileURLToPath } from 'node:url';
-import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib, quickProbe, download, downloadTimed, pool, median } from './cfip-lib.mjs';
+import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib, quickProbe, download, downloadTimed, pool, median, relinkCheckRetry } from './cfip-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = findBaseDir(HERE);   // 根目录（配置与 var\ 所在层），程序可放在 src\ 子目录
 const argv = process.argv.slice(2);
-const flag = n => argv.includes(n);
-const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
+// 参数解析：`--dry-run` / `--dry-run=true` / `--dry-run=1` 三种写法都要认
+//（旧写法只认 argv.includes('--dry-run')，写 --dry-run=true 会被当成没开 dry-run，真去写 DNS）
+const flag = n => argv.some(a => a === n || a === `${n}=true` || a === `${n}=1`);
+const opt = (n, d) => {
+  const i = argv.indexOf(n);
+  if (i >= 0 && argv[i + 1]) return argv[i + 1];
+  const kv = argv.find(a => a.startsWith(`${n}=`));
+  return kv ? kv.slice(n.length + 1) : d;
+};
 
 const CONFIG_PATH = path.resolve(HERE, opt('--config', 'cfip.config.json'));   // 内置默认配置随程序在 src\
 const USER_CONFIG_PATH = path.resolve(BASE, opt('--user-config', 'user.config.jsonc'));  // 用户配置在根目录
@@ -77,27 +84,10 @@ function done(code) {
 class ExitError extends Error { constructor(code) { super('early-exit'); this.code = code; this.isExit = true; } }
 
 // ── 源解析 ────────────────────────────────────────────────────────
-// 线上格式： 1.2.3.4:443#JP [7M]        1.2.3.4:443#HK [高速 by Jz 13M]
-// 旧版格式： 1.2.3.4:443#JP [45ms 12Mbps]
-const RE_SPEED = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)#([A-Z]{2})?\s*\[(?:高速\s*by\s*Jz\s+)?(\d+)\s*M\]\s*$/;
-const RE_LAT_BW = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)#([A-Z]{2})?\s*\[(\d+)ms\s+([\d.]+)\s*Mbps\]\s*$/;
-const RE_LOOSE = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?(?:#([A-Z]{2}))?/;
+// 解析统一由 cfip-lib.mjs 的 loadSource/parseAny 负责（支持 HTML 表格 + 纯文本 + 国家码白名单）。
+// 这里原本有一份私有的 parseLines 和三个正则，但它从未被任何代码调用（死代码），
+// 且不认识 free-nodes 系源的国家码写法，已于清理中删除，避免日后误用。
 
-function parseLines(text) {
-  const out = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    let m = line.match(RE_SPEED);
-    if (m) { out.push({ ip: m[1], port: +m[2], cc: m[3] || '', fileMs: 0, fileMbps: +m[4] }); continue; }
-    m = line.match(RE_LAT_BW);
-    if (m) { out.push({ ip: m[1], port: +m[2], cc: m[3] || '', fileMs: +m[4], fileMbps: +m[5] }); continue; }
-    m = line.match(RE_LOOSE);
-    if (m) out.push({ ip: m[1], port: m[2] ? +m[2] : Number(cfg.probe.port), cc: m[3] || '', fileMs: 0, fileMbps: 0 });
-  }
-  const seen = new Set();
-  return out.filter(r => (seen.has(r.ip) ? false : (seen.add(r.ip), true)));
-}
 
 async function httpGet(url, timeout = 20000) {
   const ctl = new AbortController();
@@ -251,14 +241,45 @@ try {
   log(`源记录：${all.length} 条`);
   if (!all.length) throw new Error('源文件没有可解析的 IP');
 
-  // 2. 候选池：去重后全部纳入，不做任何优先级排序
+  // 2. 候选池：按各域名 filter 前置排除，只测「有可能会被写入」的节点
   //    全量模式的目标是「挖最快节点」，实测才是唯一依据。
   //    订阅源标注的速度与实测毫无相关性（标称 10.27M 的实测失败、
   //    标称 4.09M 的实测 5.56M），源的新旧/评分只代表历史，不影响本轮结果。
-  //    排序只会改变测试先后，不改变最终排名，所以干脆不排序。
+  //
+  //    【前置排除】出方案时是按每个域名的 filter 筛的，凡是被所有域名都排除掉的节点，
+  //    实测多少都快都没用 —— 测了也是白测，纯浪费几十分钟。
+  //    所以这里在测速前就把它们剔掉，只留下「至少被一个域名想要」的节点。
+  //    判定用并集：只要某个域名的 filter 想要它，就保留。
+  //    （某域名 filter 为空 tokens = 不筛选 = 全都要，此时等于不排除，行为同以前。）
+  const wantedByAny = (cc) => {
+    const c = String(cc || '').toUpperCase();
+    for (const rec of (cfg.cloudflare.records || [])) {
+      const f = rec.filter;
+      if (!f || !f.tokens || f.tokens.length === 0) return true;   // 有条记录不限国家 = 全都想要
+      const set = new Set(f.tokens.map(t => String(t).toUpperCase()));
+      const mode = String(f.mode || 'deny').toLowerCase();
+      if (mode === 'allow' ? set.has(c) : !set.has(c)) return true;
+    }
+    return false;
+  };
   const P = Number(cfg.probe.port);
-  const gatePool = all.map(r => ({ ...r, port: P }));
-  log(`候选池：共 ${gatePool.length} 个（全部纳入，不排序、不截断）`);
+  const allRows = all.map(r => ({ ...r, port: P, wanted: wantedByAny(r.cc) ? 1 : 0 }));
+  const wantedRows = allRows.filter(r => r.wanted);
+  // 【安全阀】filter 一个都没命中时绝不照做 —— 那会让本轮没有任何候选，
+  //   上游换个写法、或国家码拼错，就可能导致站点彻底没有可用 IP（11-06 踩过）。
+  //   minFilterKeep 以下的极端情况同样回退，宁可多测也不冒"无候选"的险。
+  const minFilterKeep = Math.max(1, Number(cfg.probe.minFilterKeep ?? 5));
+  let gatePool;
+  if (wantedRows.length >= minFilterKeep) {
+    gatePool = wantedRows;
+    log(`候选池：源里 ${allRows.length} 个 → 按 filter 前置排除掉 ${allRows.length - wantedRows.length} 个必然用不上的节点，只测 ${gatePool.length} 个`);
+  } else if (wantedRows.length > 0) {
+    gatePool = allRows;
+    log(`⚠ filter 只命中 ${wantedRows.length} 个（少于安全值 ${minFilterKeep}），本次不做前置排除，回退测全部 ${allRows.length} 个`);
+  } else {
+    gatePool = allRows;
+    log(`⚠ filter 没有命中任何节点（国家码可能拼错了）—— 为避免本轮无候选，回退测全部 ${allRows.length} 个`);
+  }
 
   // 3. 并发预筛（16KB 小样本）—— 全量模式不做任何上限，全部节点都筛
   //    注意：这里不做 TCP 门控——实测在 TUN 代理环境下 TCP 握手会被本地接管，
@@ -270,7 +291,7 @@ try {
   const screenBytes = Number(cfg.probe.screenBytes ?? 16384);
   const screenConc = Math.max(1, Number(cfg.probe.screenConcurrency ?? 32));
   const screenTimeout = Number(cfg.probe.screenTimeoutMs ?? 2500);
-  const screenPool = gatePool;   // 全量：不设上限，一个都不跳过
+  const screenPool = gatePool;   // 已在候选池阶段按 filter 前置排除
   log(`---- 阶段1/3：并发预筛 ${screenPool.length} 个（${(screenBytes / 1024).toFixed(0)}KB 样本，并发 ${screenConc}）----`);
   log('   正在并发连接各节点，结果会逐个出现…');
 
@@ -322,6 +343,8 @@ try {
   // 5. 阶段3：对初测排名靠前的再复核若干轮（固定跑 3.0 秒，剥离 0.8s 慢启动求稳态极限）
   const verifyTop = Math.max(1, Number(cfg.probe.verifyTopN ?? 15));
   const verifyRounds = Math.max(0, Number(cfg.probe.verifyRounds ?? 2));
+  // 前置排除已经在候选池那里做过了（只测 filter 想要的节点），
+  // 这里不再需要额外的排序干预：留下来的节点本来就都是「至少被一个域名想要」的。
   const prelim = testList.map(c => {
     const ok = c.samples.filter(s => s.ok);
     return { ...c, mbps: median(ok.map(s => s.mbps)), ttfb: median(ok.map(s => s.ttfb)), okRate: ok.length / c.samples.length };
@@ -329,6 +352,10 @@ try {
     .sort((a, b) => (b.mbps - a.mbps) || (a.ttfb - b.ttfb));
 
   log(`初测合格：${prelim.length} 个（要求 ok率≥${cfg.probe.minOkRate}，速度≥${cfg.probe.minMedianMbps}Mbps）`);
+  {
+    const w = prelim.filter(r => r.wanted).length;
+    if (w < prelim.length) log(`filter 命中 ${w} 个，复核时优先安排（其余 ${prelim.length - w} 个作后备）`);
+  }
   if (prelim.length && verifyRounds > 0) {
     const verifyList = prelim.slice(0, verifyTop);
     log(`---- 阶段3/3：复核前 ${verifyList.length} 名 × ${verifyRounds} 轮（每轮跑 3.0 秒求稳态极限，剥离慢启动）----`);
@@ -347,7 +374,7 @@ try {
 
   const screened = testList;
 
-  // 6. 中位数排名
+  // 6. 中位数排名（候选池已按 filter 前置排除，这里只按实测速度排）
   const ranked = screened.map(c => {
     const ok = c.samples.filter(s => s.ok);
     const mbps = median(ok.map(s => s.mbps));
@@ -359,11 +386,41 @@ try {
   for (const r of ranked.slice(0, 12)) log(`   ${r.ip.padEnd(16)} ${r.cc} ${String(r.mbps).padStart(6)}Mbps  ttfb=${r.ttfb}ms  ok=${Math.round(r.okRate * 100)}%`);
   if (!ranked.length) throw new Error('没有节点通过质量门槛，保留现有 DNS 记录不变');
 
-  // 6. 逐记录出方案
+  // 6. 逐记录出方案（带链路复验）
+  //    【为什么必须复验】测速走的是 speed.cloudflare.com 这个通道，
+  //    有些节点能测出很高速度，但用你自己的域名去访问根本打不开
+  //    （典型：SNI 敏感的中转/反代 IP、或已被拉黑的节点）。
+  //    写进 DNS 前用真实域名做一次 HTTPS 请求，打不开的直接剔除并由后面的候选补上。
   const plan = [];
+  const relinkCache = new Map();          // `${domain}|${ip}` → 结果，同一对只测一次
+  const relinkOne = async (domain, ip) => {
+    const key = `${domain}|${ip}`;
+    if (!relinkCache.has(key)) relinkCache.set(key, await relinkCheckRetry(ip, domain, 3));
+    return relinkCache.get(key);
+  };
+  const relinkDead = [];
+  let relinkTried = 0;
   for (const rec of (cfg.cloudflare.records || [])) {
-    const picked = applyFilter(ranked, rec.filter).slice(0, rec.topN);
+    // 全量模式沿用每个域名自己的 topN（不做全局硬上限，这一点和快速模式不同）
+    const limit = Math.max(1, Number(rec.topN ?? 3));
+    const candidates = applyFilter(ranked, rec.filter);
+    const picked = [];
+    const triedIps = new Set();
+    const maxTry = Math.min(candidates.length, Math.max(limit * 4, limit + 5));
+    for (const cand of candidates) {
+      if (picked.length >= limit || triedIps.size >= maxTry) break;
+      triedIps.add(cand.ip);
+      relinkTried++;
+      const rr = await relinkOne(rec.name, cand.ip);
+      if (rr.ok) picked.push({ ...cand, relinkColo: rr.colo });
+      else relinkDead.push({ name: rec.name, ip: cand.ip, err: rr.err || ('HTTP ' + rr.code) });
+    }
     plan.push({ rec, ips: picked.map(r => r.ip), detail: picked });
+  }
+  if (relinkTried) {
+    log(`---- 链路复验：试了 ${relinkTried} 次，剔除 ${relinkDead.length} 个「测速能过、但你的域名打不开」的节点 ----`);
+    for (const d of relinkDead) log(`   ✘ ${d.ip.padEnd(16)} ${d.name} → ${d.err}`);
+    if (!relinkDead.length) log('   ✔ 全部通过，没有需要剔除的节点');
   }
   log('---- 目标方案 ----');
   for (const p of plan) log(`   ${p.rec.name} (${p.rec.type}, top${p.rec.topN}) <- ${p.ips.join(', ') || '(空)'}`);
