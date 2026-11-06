@@ -35,9 +35,10 @@ try {
 }
 
 if (-not $downloadUrl) {
-    # 备用固定下载链接
+    # 备用链接用「永久 latest 直链」——GitHub 会自动指向当前最新版，
+    # 千万不要写死某个版本号，否则 API 一超时就会「升级」回旧版。
     $tagName = "latest"
-    $downloadUrl = "https://github.com/buyikun/cf-best-ip/releases/download/v1.0.0/cf-best-ip.zip"
+    $downloadUrl = "https://github.com/buyikun/cf-best-ip/releases/latest/download/cf-best-ip.zip"
 }
 
 Write-Host "  ✓ 目标更新版本: $tagName" -ForegroundColor Green
