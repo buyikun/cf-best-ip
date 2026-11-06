@@ -31,6 +31,19 @@ const opt = (n, d) => {
   const kv = argv.find(a => a.startsWith(`${n}=`));
   return kv ? kv.slice(n.length + 1) : d;
 };
+// 数值参数统一校验：与快速模式保持一致。
+//   以前直接 Number() 转换，写成 --candidates abc 会变 NaN，
+//   survivors.slice(0, NaN) 得到空数组，最后报「无可用节点」误导成网络故障。
+const optNum = (n, d, min = 1, max = 1e9) => {
+  const raw = opt(n);
+  if (raw === undefined) return d;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < min || v > max) {
+    console.error(`参数 ${n} 的值「${raw}」不合法，应为 ${min}~${max} 之间的数字`);
+    process.exit(2);
+  }
+  return v;
+};
 
 const CONFIG_PATH = path.resolve(HERE, opt('--config', 'cfip.config.json'));   // 内置默认配置随程序在 src\
 const USER_CONFIG_PATH = path.resolve(BASE, opt('--user-config', 'user.config.jsonc'));  // 用户配置在根目录
@@ -39,9 +52,9 @@ if (!uploadReady) cfg.behavior.dryRun = true;   // 没填凭据 = 强制只测�
 const FORCE = flag('--force');
 const VERBOSE = flag('--verbose');
 const DRY_RUN = flag('--dry-run') || cfg.behavior.dryRun === true;
-if (opt('--candidates')) cfg.probe.candidates = Number(opt('--candidates'));
-if (opt('--rounds')) cfg.probe.rounds = Number(opt('--rounds'));
-if (opt('--port')) cfg.probe.port = Number(opt('--port'));
+if (opt('--candidates') !== undefined) cfg.probe.candidates = optNum('--candidates', cfg.probe.candidates, 0, 100000);
+if (opt('--rounds') !== undefined) cfg.probe.rounds = optNum('--rounds', cfg.probe.rounds, 1, 20);
+if (opt('--port') !== undefined) cfg.probe.port = optNum('--port', cfg.probe.port, 1, 65535);
 const CFG_DIR = BASE;
 const LOG_DIR = path.resolve(CFG_DIR, cfg.behavior.logDir || 'var/logs');
 const BAK_DIR = path.resolve(CFG_DIR, cfg.behavior.backupDir || 'var/backups');
@@ -428,9 +441,13 @@ try {
   //   否则 keep 为空集合 → 该域名现有 A 记录会被全部删除。
   //   典型误配：filter.mode="allow" 但国家码拼错（如写成 SGP 而不是 SG）。
   const actionable = [];
+  const blocked = [];
   for (const p of plan) {
-    if (p.ips.length === 0) log(`   ⚠ ${p.rec.name}：按 filter 筛选后 0 个节点，已跳过该域名（不会清空现有记录）`);
-    else actionable.push(p);
+    if (p.ips.length === 0) {
+      p.next = []; p.same = true;
+      blocked.push(p);
+      log(`   ⚠ ${p.rec.name}：按 filter 筛选后 0 个节点，已跳过该域名（不会清空现有记录）`);
+    } else actionable.push(p);
   }
 
   // 7. 与现状比对
@@ -453,7 +470,18 @@ try {
     throw new ExitError(0);
   }
   if (!changed && cfg.behavior.skipIfUnchanged && !FORCE) {
-    log('结论：所有记录已是最优集合，跳过写入。');
+    // 【提示要如实】与快速模式保持一致：不能笼统说「已是最优集合」。
+    //   若域名全被 filter 筛成 0 个节点，真实情况是「没有可选 IP、现有记录可能已失效」，
+    //   说成「最优」会让用户以为一切正常，而站点实际可能已经打不开。
+    if (actionable.length === 0 && blocked.length > 0) {
+      log('结论：本次没有可写入的节点，DNS 记录保持不变。');
+      log('   ⚠ 上面列出的域名都被 filter 筛成了 0 个节点 —— 现有记录若已不可用，站点就会打不开。');
+      log('   建议放宽 filter（改成 "mode": "deny" 且 tokens 留空即不限国家），详见 user.config.jsonc 里的注释。');
+    } else if (blocked.length > 0) {
+      log(`结论：可更新的 ${actionable.length} 个域名已是最优集合，跳过写入（另有 ${blocked.length} 个域名被 filter 筛成 0 个节点）。`);
+    } else {
+      log('结论：所有记录已是最优集合，跳过写入。');
+    }
     fs.writeFileSync(STATE_FILE, JSON.stringify({ lastRunAt: new Date().toISOString(), skipped: true, plan: actionable.map(p => ({ name: p.rec.name, ips: p.next })) }, null, 2));
     throw new ExitError(0);
   }
