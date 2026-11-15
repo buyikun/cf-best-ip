@@ -109,6 +109,7 @@ Write-Host "     [保护] var/ 目录 (运行日志与历史缓存) —— 绝�
 $allowedItems = @(
     'src',
     'README.md',
+    'LICENSE',
     'run-fast.cmd',
     'run-full.cmd',
     'run-cfip.cmd',
