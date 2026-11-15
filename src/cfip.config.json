@@ -13,8 +13,8 @@
     "urls": [
       { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/xinyitang3/ipv4.txt", "tier": "fresh", "name": "Mia优选(港/新/韩/日/美)" },
       { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/tiancheng/all.txt", "tier": "fresh", "name": "天诚优选1(港/新/韩/日/美/台/德)" },
-      { "url": "https://api.uouin.com/cloudflare.html", "tier": "fresh", "name": "麒麟优选(HTML,运营商分组)" },
-      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" }
+      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt", "tier": "fresh", "name": "junzhen北京电信" },
+      { "url": "https://776771.xyz/all.txt", "tier": "fresh", "name": "776771优选(港/新/日/美/韩/台)" }
     ],
     "merge": true,
     "preferUrl": true,
@@ -35,6 +35,12 @@
     "screenConcurrency": 32,
     "screenTimeoutMs": 2500,
     "minMedianMbps": 1.0,
+    "acceptMinMbps": 0,
+    "connections": 4,
+    "speedMetric": "steady",
+    "speedUrl": "auto",
+    "limitedAsFail": true,
+    "protocol": "h1",
     "minOkRate": 0.5
   },
 
@@ -42,6 +48,12 @@
     "_说明": "快速模式默认参数。常用项都在 user.config.jsonc 里有一份带注释的副本。",
     "localBandwidthMbps": 0,
     "targetMbps": 8,
+    "acceptMinMbps": 0,
+    "connections": 4,
+    "speedMetric": "steady",
+    "speedUrl": "auto",
+    "limitedAsFail": true,
+    "protocol": "h1",
     "targetRatio": 0.6667,
     "targetMaxMbps": 20,
     "targetTtlDays": 30,

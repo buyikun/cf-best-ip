@@ -129,9 +129,12 @@
    - **前置排除**：在测速**之前**就按各域名的 `filter` 剔掉「注定用不上」的节点 —— 凡是所有域名都不想要的国家，测出多快都不会被写入，测它纯属浪费。判定用并集：任一域名想要就保留。
      实测 421 个里只剩 56 个要测，整轮快 7 倍以上。命中数低于 `minFilterKeep`（5）时**不做排除、回退测全部**，避免国家码写错导致本轮没有任何候选。
    - **并发预筛**：16KB 极小样本并发判断节点究竟通不通。实测判定准确率 **100%**。预筛不关心速度准不准，故并发开大不受影响。
-   - **串行精测**：仅对存活节点测速，每节点严格跑 1.5 秒硬掐断。必须串行 —— 并发会互抢带宽（实测把 77 Mbps 压成 8 Mbps，排名完全失真）。
+   - **串行精测**：仅对存活节点测速，每节点严格跑 1.5 秒硬掐断，同时开 `connections`（4）条连接取**合计**速度。必须串行 —— 并发会互抢带宽（实测把 77 Mbps 压成 8 Mbps，排名完全失真）。
      凑够 `targetCount`（10）个候选、且至少测满 `minProbe`（60）个即停。
+     **为什么要多连接**：单条 TCP 连接常被流控卡住，吃不满节点实际能给的带宽，于是单连接测出的速度会系统性偏低（实测有的节点单连接只有 4.9 Mbps、4 连接是 32.5 Mbps，会被达标线误判成不合格）；而浏览器看视频本身也是多连接。
 4. **复核**：入围节点以固定时长稳态测速复核 `verifyRounds`（2）轮，每节点严格跑 3.0 秒，剥离前 0.8 秒慢启动求稳态极限，取中位数后按真实达标线重新判定。
+   复核会**记录最差那一轮的速度**：若 `acceptMinMbps`（默认 0 = 关闭）大于 0，则「最差一轮低于该值」的节点一律剔除 ——
+   中位速度漂亮、却会突然掉到几 Mbps 的节点就是这么挡掉的。若全部低于该值，则只取速度最高的 1 个保底，不会凑满 `uploadCount` 个。
 5. **链路复验**：写进 DNS 前，用**你自己的域名**对每个候选真实访问一次（SNI 与 Host 都是你的域名）。
    能测速 ≠ 你的站点能打开 —— 实测有节点测速 20+ Mbps、换成自己的域名直接 `ECONNRESET`。每个候选最多试 3 次，剔除偶发抖动导致的误判。
 6. **保住现役**：只是「数量不够要补齐」时，体检达标的 IP 优先占位，只用新优选的补足空额，不会为了凑数把正在正常工作的 IP 一起换掉。
@@ -145,7 +148,7 @@
 2. **前置排除**：按各域名 `filter` 的并集，剔掉所有域名都不要的节点 —— 实测 421 个里只测 56 个，预筛从 256 秒降到 33 秒。命中数低于 `minFilterKeep`（5）时回退测全部
 3. **预筛**：每节点下载 16KB 样本，淘汰死节点。不设数量上限，并发 32
 4. **初测**：存活者各测 1.5 秒，排出初步名次
-5. **复核**：初测前 `verifyTopN`（15）名各测 `verifyRounds`（2）轮，每轮 3.0 秒（剥离 0.8 秒慢启动）求稳态极限
+5. **复核**：初测前 `verifyTopN`（15）名各测 `verifyRounds`（2）轮，每轮 3.0 秒（剥离 0.8 秒慢启动）求稳态极限；同样受 `probe.acceptMinMbps` 最低速度门槛约束
 6. **链路复验**：与快速模式同一机制，写前用你的真实域名逐个验证
 7. 按各记录的 `filter` 取前 `topN` 个写入 Cloudflare
 
@@ -182,15 +185,15 @@
 "urls": [
   { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/xinyitang3/ipv4.txt", "tier": "fresh", "name": "Mia优选" },
   { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/tiancheng/all.txt",   "tier": "fresh", "name": "天诚优选1" },
-  { "url": "https://api.uouin.com/cloudflare.html",                                     "tier": "fresh", "name": "麒麟优选" },
-  { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt",                                 "tier": "fresh", "name": "junzhen北京电信" }
+  { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt",                                 "tier": "fresh", "name": "junzhen北京电信" },
+  { "url": "https://776771.xyz/all.txt",                                                "tier": "fresh", "name": "776771优选" }
 ]
 ```
 
 **两种格式均能解析**
 
 - 纯文本订阅，如 `1.2.3.4:443#JP [7M]`、`1.2.3.4:443#JP [45ms 12Mbps]`
-- **HTML 表格**（如麒麟优选），自动识别 `序号／运营商／IP／丢包率` 四列；运营商会映射为 `TEL/UNI/CMB/MUL` 存入 `cc` 字段，国家码过滤同样可用
+- **HTML 表格**（部分源用网页表格发布），自动识别 `序号／运营商／IP／丢包率` 四列；运营商会映射为 `TEL/UNI/CMB/MUL` 存入 `cc` 字段，国家码过滤同样可用
 
 **国家码写在哪儿都行**：部分源的写法是 `1.2.3.4:443#某优选 | 港岛茶记 | HK | ...`，国家码并不紧贴 `#`。程序会从 `#` 后的整段文字中按国家码白名单提取，连个别源为防止抓取而插入的零宽空格混淆也能识破。
 
@@ -257,6 +260,12 @@
 | `probe.verifyDurationSec` | 3.0 | 全量模式复核跑 3.0 秒求稳态极限 |
 | `probe.verifyWarmSec` | 0.8 | 剥离前 0.8 秒慢启动 |
 | `fast.minFilterKeep` / `probe.minFilterKeep` | 5 | 测速前按 filter 前置排除的安全阀：命中数低于此值则回退测全部 |
+| `fast.acceptMinMbps` / `probe.acceptMinMbps` | 0 | ★最低速度门槛：按复核中**最差一轮**判定，低于此值的一律剔除；若全部低于则只取最快的 1 个保底，不凑满 `uploadCount`/`topN`。`0` = 关闭 |
+| `fast.connections` / `probe.connections` | 4 | ★多连接测速：同一 IP 同时开几条连接，速度取**合计**。单连接常被流控限制而系统性偏低（实测有的节点 4 连接比单连接快 6 倍），浏览器看视频本身也是多连接。`1` = 退回单连接；最多 16 |
+| `fast.speedMetric` / `probe.speedMetric` | `steady` | ★判定速度口径：`steady` = 稳态均值（代表长期能稳住多少）/ `peak` = 1 秒滑动窗口峰值（代表最好能跑多快）/ `ewma` = 指数加权滑动平均（借鉴 XIU2，对慢启动更宽容）。实测 steady 与 peak 可差 2 倍 |
+| `fast.speedUrl` / `probe.speedUrl` | `auto` | ★测速地址：`auto` = 按顺序探活 `speed.cloudflare.com` → `cf.090227.xyz`（移动专用）→ `speed.okl.abrdns.com`，用第一个通的；也可直接填完整 URL 固定使用。**注意换地址不能解除「限速(429)」** —— 429 是节点级限流，与用哪个地址无关 |
+| `fast.limitedAsFail` / `probe.limitedAsFail` | `true` | ★遇到 429 限速时本轮测速是否判无效（借鉴 CFST-GUI 的「429 = 无效结果」）。`true` = 只要有连接被限速就判这一轮无效、该节点不参与排名（推荐）；`false` = 只标注仍按剩余连接算速度。多连接是「几条连接速度相加」，被限速时合计值只反映「我们被限流了」，不是节点真实速度 |
+| `fast.protocol` / `probe.protocol` | `h1` | ★测速走哪个 HTTP 协议（借鉴 CFST-GUI 的 `ProtocolAuto`）：`h1` = 只用 HTTP/1.1（默认）/ `h2` = HTTP/2 / `auto` = 每个节点先做 TLS ALPN 协商、支持才用 h2 / `h3` = 暂不支持（Node 核心无 QUIC，程序如实按 h1 跑并说明）。**实测 `speed.cloudflare.com` 端点本身只提供 HTTP/1.1**，故当前配置下 h2 不生效（用 `www.cloudflare.com` / `www.google.com` 试 ALPN 能正确协商出 h2，机制无误）；把 `speedUrl` 换成支持 h2 的大文件地址后选 `auto` 即可用上 |
 
 ---
 
@@ -315,6 +324,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File src\make-desktop-shortcuts.p
 | `run-cfip.cmd` | 命令行通用入口，可带 `fast`／`full` 与参数 |
 | `make-desktop-shortcuts.cmd` | 双击在桌面创建两个快捷方式 |
 | `README.md` | 本文档 |
+| `LICENSE` | 开源许可证（GPL-3.0） |
 | `src\cfip-fast.mjs` / `cfip-auto.mjs` | 快速／全量模式主流程 |
 | `src\cfip-lib.mjs` | 两者共用的工具：源拉取与解析、探测、CF API、DoH 校验、配置加载、带宽探测、旧文件清理 |
 | `src\cfip.config.json` | 程序内置默认参数（凭据段为占位，永远不会被使用） |
@@ -362,3 +372,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File src\make-desktop-shortcuts.p
 - DNS 的 A 记录只能存 IP、不能存端口，故探测统一使用 **443**；只在 8443／2096 之类端口可用的节点会被淘汰
 - 本机若开着 mihomo／Clash 的 TUN，TCP 层探测会被"假接通"，真正的筛选依靠 HTTP 下载那一步
 - `user.config.jsonc` 含明文 Token，请勿截图外发、勿提交到公开仓库
+
+---
+
+## 许可
+
+本项目以 **GNU General Public License v3.0**（GPL-3.0）发布，全文见 [LICENSE](LICENSE)。
+
+之所以选 GPL-3.0 而不是 MIT：本项目的部分实现是**参照同领域的开源项目**做的，其中
+[CFData-WEB](https://github.com/PoemMisty/CFData-WEB)、[CFST-GUI](https://github.com/axuitomo/CFST-GUI)、
+[XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) 都是 GPL-3.0 许可。
+具体借鉴了这几处（都是思路与算法层面的移植，代码为 JavaScript 重写）：
+
+| 借鉴点 | 来源 | 说明 |
+|---|---|---|
+| 多测速地址自动探活切换 | CFData-WEB `speed_url.go` | `speedUrl` 配置项与 `pickAutoSpeedUrl()` |
+| 「429 限速 = 本轮无效」 | CFST-GUI `internal/task/download.go` | `limitedAsFail` 配置项 |
+| HTTP 协议可选（h1 / h2 / auto） | CFST-GUI `internal/httpclient/client.go` | `protocol` 配置项 |
+| EWMA 滑动平均测速口径 | XIU2 `task/download.go` | `speedMetric: "ewma"` |
+
+**如果你只是自己用**：GPL 的义务只在「分发」时才产生，本地自己跑不承担任何义务。
+
+**如果你要二次分发或商用**：请一并遵守 GPL-3.0 —— 保留版权声明、公开你修改后的源码。

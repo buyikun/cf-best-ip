@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import https from 'node:https';
+import tls from 'node:tls';
+import http2 from 'node:http2';
 
 // ── 环境自检（方便整个文件夹拷给别人用：先给出人话提示，而不是一堆报错）──
 const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
@@ -100,14 +102,14 @@ export function parseLines(text, defaultPort = 443) {
 }
 
 /**
- * 解析 HTML 页面里的优选 IP 表格（如 api.uouin.com/cloudflare.html）
+ * 解析 HTML 页面里的优选 IP 表格（部分源用网页表格发布，而非纯文本）
  * 页面结构：每行 = 序号 | 运营商(电信/联通/移动/多线) | IP | 丢包率 | ...
  * 没有端口信息 -> 默认 443
  * 返回格式与 parseLines 一致，cc 字段借用运营商（TEL/UNI/CMB/MUL），filter 也能用
  */
 export function parseHtmlTable(html) {
   const out = [];
-  // 麒麟页面出现过 4 种分组：电信/联通/移动/多线
+  // 这类运营商表格页面出现过 4 种分组：电信/联通/移动/多线
   const carrierMap = { '电信': 'TEL', '联通': 'UNI', '移动': 'CMB', '多线': 'MUL', 'All': 'MUL', '全局': 'MUL' };
   // 匹配每个 <tr>...</tr> 里的 <td> 内容
   const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
@@ -308,12 +310,16 @@ export function download(ip, port, bytes, timeout, onProgress) {
       resolve({ ok, mbps: +mbps.toFixed(2), ttfb: ok ? ttfb : 0, total, got, colo, err: err || '' });
     };
     const req = https.request({
-      host: ip, port, path: `/__down?bytes=${bytes}`, method: 'GET',
-      servername: 'speed.cloudflare.com', rejectUnauthorized: false,
-      headers: { Host: 'speed.cloudflare.com', 'User-Agent': UA }
+      host: ip, port, path: withBytes(SPEED_PATH, bytes), method: 'GET',
+      servername: SPEED_HOST, rejectUnauthorized: false,
+      // Accept-Encoding: identity —— 要服务器别压缩，否则「下载了多少字节」不等于「实际传输量」，
+      //   速度会被算歪。参考 CFData-WEB combined_refactor/tasks_speed.go:49 的同一处理。
+      headers: { Host: SPEED_HOST, 'User-Agent': UA, 'Accept-Encoding': 'identity' }
     }, res => {
-      // 1. 状态码必须是 200
-      if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
+      // 1. 状态码必须是 200（429 单独标注：Cloudflare 对测速接口有限速，
+      //   「被限速」和「节点慢」是两回事，混在一起会让人误以为节点质量差。
+      //   参考 CFData-WEB combined_refactor/tasks_speed.go:131-136。）
+      if (res.statusCode !== 200) { res.resume(); return fin(false, res.statusCode === 429 ? '限速(429)' : 'HTTP ' + res.statusCode); }
 
       // 2. 严查是否为真实的 Cloudflare 边缘节点，过滤伪装/默认网页主机（如只返回几KB html 却算成上百Mbps的假节点）
       const server = String(res.headers['server'] || '').toLowerCase();
@@ -359,6 +365,81 @@ export function download(ip, port, bytes, timeout, onProgress) {
 }
 
 /**
+ * 从采样时间线算出三种速度口径（纯计算，不碰网络，方便单测）。
+ *
+ * @param {Array<{t:number,got:number}>} timeline 相对时刻(ms) → 累计接收字节数
+ * @param {number} warmMs 丢弃前多少毫秒（剥离 TCP 慢启动）
+ * @param {number} netSec 净时长（秒）= (totalMs - ttfb)/1000
+ * @param {number} got    累计接收字节数
+ * @returns {{steadyMbps:number, overallMbps:number, peakMbps:number, ewmaMbps:number}}
+ */
+export function computeSpeedMetrics(timeline, warmMs, netSec, got) {
+  let basePoint = null;
+  for (const pt of timeline) {
+    if (pt.t >= warmMs) { basePoint = pt; break; }
+  }
+  const endPoint = timeline[timeline.length - 1] || { t: netSec * 1000, got };
+  let steadyMbps = 0;
+  if (basePoint && endPoint.t > basePoint.t) {
+    const deltaBytes = endPoint.got - basePoint.got;
+    const deltaSec = (endPoint.t - basePoint.t) / 1000;
+    steadyMbps = deltaSec > 0 ? (deltaBytes * 8) / deltaSec / 1e6 : 0;
+  } else {
+    steadyMbps = netSec > 0 ? (got * 8) / netSec / 1e6 : 0;
+  }
+  const overallMbps = netSec > 0 ? (got * 8) / netSec / 1e6 : 0;
+
+  // 1 秒滑动窗口峰值。
+  //   为什么不直接看「某两个相邻采样点之间」的瞬时值：单次采样间隔里的字节数会被
+  //   内核缓冲/重传打散，用它做除数会得到 0 和尖峰交替的读数。
+  //   固定 1 秒窗口把这种抖动抹平，同时还能抓住「这个节点最好能跑到多少」。
+  //   借鉴 CFST-GUI internal/task/download.go:41（downloadSpeedWindow = time.Second）
+  //   与 :777-795 windowSpeedLocked、:847-850（最高速率同样取滑动窗口速率）。
+  const WIN_MS = 1000;
+  let peakMbps = 0;
+  {
+    const pts = timeline.filter(pt => pt.t >= warmMs);
+    let j = 0;
+    for (let i = 0; i < pts.length; i++) {
+      if (j < i) j = i;
+      while (j < pts.length && pts[j].t - pts[i].t < WIN_MS) j++;
+      if (j >= pts.length) break;
+      const dt = (pts[j].t - pts[i].t) / 1000;
+      const db = pts[j].got - pts[i].got;
+      const rate = dt > 0 ? (db * 8) / dt / 1e6 : 0;
+      if (rate > peakMbps) peakMbps = rate;
+    }
+    if (peakMbps === 0 && steadyMbps > 0) peakMbps = steadyMbps;   // 采样点太稀疏时退回稳态值
+  }
+
+  // EWMA（指数加权移动平均）速度 —— 借鉴 XIU2/CloudflareSpeedTest 的 task/download.go：
+  //   它把测速窗口切成固定长度的小片，每片把「这片新增的字节数」换算成瞬时速度喂给 EWMA，
+  //   最后用收敛值作为速度（那边用的是 VividCortex/ewma 这个库）。
+  //   相比「整段简单平均」，EWMA 更看重最近的瞬时表现，但对单次采样的抖动又不敏感 ——
+  //   正好对付 CF 节点「忽快忽慢」的毛病。
+  //   公式：v = α·cur + (1−α)·v，α = 2/(N+1)；取 N = 5 → α ≈ 0.3333（ewma 库默认年龄）。
+  const EWMA_SLICE_MS = 100, EWMA_ALPHA = 2 / 6;
+  let ewmaMbps = 0;
+  {
+    const pts = timeline.filter(pt => pt.t >= warmMs);
+    if (pts.length >= 2) {
+      let v = 0, n = 0, sliceT = pts[0].t, sliceGot = pts[0].got;
+      for (let i = 1; i < pts.length; i++) {
+        const dt = pts[i].t - sliceT;
+        if (dt < EWMA_SLICE_MS) continue;
+        const rate = ((pts[i].got - sliceGot) * 8) / (dt / 1000) / 1e6;
+        v = n === 0 ? rate : EWMA_ALPHA * rate + (1 - EWMA_ALPHA) * v;
+        n++;
+        sliceT = pts[i].t; sliceGot = pts[i].got;
+      }
+      ewmaMbps = n > 0 ? v : steadyMbps;   // 采样点太稀疏时退回稳态值
+    } else ewmaMbps = steadyMbps;
+  }
+
+  return { steadyMbps, overallMbps, peakMbps, ewmaMbps };
+}
+
+/**
  * 现代稳态测速引擎：固定时长测速（Duration-based），并剥离 TCP 慢启动
  * 
  * 优势：
@@ -371,7 +452,7 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
     let ttfb = 0, got = 0, done = false, timer = null, guardTimer = null, colo = '';
     const timeline = [];
 
-    const fin = (ok, err = '') => {
+    const fin = (ok, err = '', retryAfter = 0) => {
       if (done) return;
       done = true;
       if (timer) clearTimeout(timer);
@@ -380,31 +461,17 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
 
       const totalMs = Date.now() - t0;
       if (!ok) {
-        return resolve({ ok: false, err: err || 'failed', totalMs, ttfb, mbps: 0, steadyMbps: 0, got, colo });
+        return resolve({ ok: false, err: err || 'failed', retryAfter, totalMs, ttfb, mbps: 0, steadyMbps: 0, peakMbps: 0, ewmaMbps: 0, got, colo });
       }
 
-      // 剥离慢启动，计算稳态净速率
+      // 剥离慢启动，算出三种速度口径（纯计算部分抽成 computeSpeedMetrics，便于单测）
       const warmMs = warmSeconds * 1000;
-      let basePoint = null;
-      for (const pt of timeline) {
-        if (pt.t >= warmMs) { basePoint = pt; break; }
-      }
-      const endPoint = timeline[timeline.length - 1] || { t: totalMs - ttfb, got };
-      let steadyMbps = 0;
-      if (basePoint && endPoint.t > basePoint.t) {
-        const deltaBytes = endPoint.got - basePoint.got;
-        const deltaSec = (endPoint.t - basePoint.t) / 1000;
-        steadyMbps = deltaSec > 0 ? (deltaBytes * 8) / deltaSec / 1e6 : 0;
-      } else {
-        const netSec = (totalMs - ttfb) / 1000;
-        steadyMbps = netSec > 0 ? (got * 8) / netSec / 1e6 : 0;
-      }
       const netSecTotal = (totalMs - ttfb) / 1000;
-      const overallMbps = netSecTotal > 0 ? (got * 8) / netSecTotal / 1e6 : 0;
-
+      const { steadyMbps, overallMbps, peakMbps, ewmaMbps } = computeSpeedMetrics(timeline, warmMs, netSecTotal, got);
       resolve({
         ok: true,
         err: '',
+        retryAfter: 0,
         totalMs,
         ttfb,
         got,
@@ -412,6 +479,8 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
         mbps: +steadyMbps.toFixed(2),       // 默认对外暴露的值即为稳态速度
         overallMbps: +overallMbps.toFixed(2),
         steadyMbps: +steadyMbps.toFixed(2),
+        peakMbps: +peakMbps.toFixed(2),     // 1 秒滑动窗口峰值（判定指标可选，见 cfg.*.speedMetric）
+        ewmaMbps: +ewmaMbps.toFixed(2),     // EWMA 加权平均（判定指标可选，见 cfg.*.speedMetric）
         duration: +netSecTotal.toFixed(2)
       });
     };
@@ -419,11 +488,19 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
     // CF 官方接口单次最大允许 50MB (52428800)
     const bigBytes = 52428800;
     const req = https.request({
-      host: ip, port, path: `/__down?bytes=${bigBytes}`, method: 'GET',
-      servername: 'speed.cloudflare.com', rejectUnauthorized: false,
-      headers: { Host: 'speed.cloudflare.com', 'User-Agent': UA }
+      host: ip, port, path: withBytes(SPEED_PATH, bigBytes), method: 'GET',
+      servername: SPEED_HOST, rejectUnauthorized: false,
+      headers: { Host: SPEED_HOST, 'User-Agent': UA, 'Accept-Encoding': 'identity' }
     }, res => {
-      if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
+      if (res.statusCode !== 200) {
+        // 429 是 Cloudflare 对这个节点限速；实测 403 也常常是同一套拒绝（探针里
+        //   speed.cloudflare.com/__down 的 12MB、以及 cf.xiu2.xyz、cf.090227.xyz 都出现过 403）。
+        // 把 Retry-After 带回去，才能告诉用户「这个节点要等多久」，而不是干巴巴一个 0Mbps。
+        const ra = Number(res.headers['retry-after']);
+        const label = res.statusCode === 429 ? '限速(429)' : (res.statusCode === 403 ? '被拒(403)' : 'HTTP ' + res.statusCode);
+        res.resume();
+        return fin(false, label, Number.isFinite(ra) && ra > 0 ? ra : 0);
+      }
       const server = String(res.headers['server'] || '').toLowerCase();
       const hasCfRay = !!res.headers['cf-ray'];
       colo = String(res.headers['cf-ray'] || '').split('-').pop() || '';
@@ -461,6 +538,226 @@ export function downloadTimed(ip, port, durationSeconds = 2.5, warmSeconds = 0.8
 }
 
 /**
+ * 多连接测速：同一个 IP 同时开 connections 条连接，返回合计吞吐。
+ *
+ * 为什么要多条：单条 TCP 连接受流控/接收窗口限制，往往吃不满这个节点实际能给到的带宽，
+ *   于是「单连接测出来的速度」会系统性偏低（实测同一节点 4 连接合计比单连接快约 1.5 倍）。
+ *   而浏览器看视频/下载本身也是多连接，所以多连接的口径更接近真实体验。
+ *   借鉴 CFST-GUI internal/task/download.go:34 `defaultDownloadGetConcurrency = 4`
+ *   （其注释见 :42-44：默认单 IP 串行，但允许用并发换准确度）。
+ *
+ * 合计口径：只累加成功连接的吞吐；全部失败才算失败。
+ *   ttfb 取各连接中最快的一个（代表「首字节要等多久」）。
+ *
+ * @param {number} connections 连接数，1 表示退回单连接（与 downloadTimed 完全一致）
+ */
+export async function downloadTimedMulti(ip, port, durationSeconds = 2.5, warmSeconds = 0.8, connections = 1, onProgress = null, metric = 'steady', limitedAsFail = true) {
+  const n = Math.max(1, Math.min(16, Math.floor(Number(connections)) || 1));
+  const isLimited = s => /限速\(429\)|被拒\(403\)/.test(String(s || ''));
+  if (n === 1) {
+    const r = await measureOnce(ip, port, durationSeconds, warmSeconds, onProgress);
+    const m = metric === 'peak' ? (r.peakMbps || r.mbps || 0)
+            : metric === 'ewma' ? (r.ewmaMbps || r.mbps || 0)
+            : (r.mbps || 0);
+    return { ...r, mbps: +m.toFixed(2), connections: 1, okCount: r.ok ? 1 : 0, limitedCount: (!r.ok && isLimited(r.err)) ? 1 : 0 };
+  }
+
+  const parts = await Promise.all(
+    Array.from({ length: n }, () => measureOnce(ip, port, durationSeconds, warmSeconds, null))
+  );
+  const okParts = parts.filter(p => p.ok);
+  const sum = k => okParts.reduce((a, p) => a + (Number(p[k]) || 0), 0);
+  const steadyMbps = sum('steadyMbps');
+  const overallMbps = sum('overallMbps');
+  const peakMbps = sum('peakMbps');
+  const ewmaMbps = sum('ewmaMbps');
+  const ttfbList = okParts.map(p => p.ttfb).filter(v => v > 0);
+  // 【限速可见性】多连接只要有一条成功就算成功，所以「4 条里 3 条吃 429」会被悄悄掩盖，
+  //   最后只表现为「这个节点有点慢」。把受限条数和 Retry-After 暴露出来，日志才能分清
+  //   「节点本来就慢」和「节点被 Cloudflare 限速了」——这两件事的处理方式完全不同。
+  const limitedCount = parts.filter(p => !p.ok && isLimited(p.err)).length;
+  const retryAfter = Math.max(0, ...parts.map(p => Number(p.retryAfter) || 0));
+  // 【借鉴 CFST-GUI 的 429 语义】internal/task/download.go:492 把 429 当作「无效结果」
+  //   （invalidDownloadResultWithRetryAfter("rate_limited", true, retryAfter)），随后按
+  //   Retry-After 退避重试。我们等不起（实测 Retry-After 37~60 分钟），所以改成
+  //   「只要有连接被限速，这一轮测量就判无效」—— 否则合计速度只是剩下几条连接的和，
+  //   会系统性低估这个节点：既可能冤枉好节点，也可能让正在限流的节点混进排名。
+  //   想退回旧行为（只标注、不判死）就把 limitedAsFail 设为 false。
+  const limited = limitedAsFail !== false && limitedCount > 0;
+  const okFinal = okParts.length > 0 && !limited;
+
+  return {
+    ok: okFinal,
+    limitedCount,
+    retryAfter,
+    err: okFinal ? '' : (limited ? '限速(429)' : (limitedCount === n ? '限速(429)' : (parts.find(p => p.err)?.err || 'failed'))),
+    totalMs: Math.max(...parts.map(p => Number(p.totalMs) || 0)),
+    ttfb: ttfbList.length ? Math.min(...ttfbList) : 0,
+    got: sum('got'),
+    colo: okParts.find(p => p.colo)?.colo || '',
+    protocol: okParts.find(p => p.protocol)?.protocol || 'h1',
+    // mbps 是对外暴露的判定值：steady = 稳态均值（默认），peak = 1 秒滑动窗口峰值，ewma = 指数加权平均
+    mbps: okFinal ? +(metric === 'peak' ? peakMbps : metric === 'ewma' ? ewmaMbps : steadyMbps).toFixed(2) : 0,
+    overallMbps: okFinal ? +overallMbps.toFixed(2) : 0,
+    steadyMbps: okFinal ? +steadyMbps.toFixed(2) : 0,
+    peakMbps: okFinal ? +peakMbps.toFixed(2) : 0,
+    ewmaMbps: okFinal ? +ewmaMbps.toFixed(2) : 0,
+    duration: Math.max(...parts.map(p => Number(p.duration) || 0)),
+    connections: n,
+    okCount: okParts.length
+  };
+}
+
+// ── 协议选项（借鉴 CFST-GUI internal/httpclient/client.go:25-29 的 Protocol*
+//   与 internal/task/download.go:35 `defaultDownloadHTTPProtocol = ProtocolAuto`）──
+//   'h1'   只用 HTTP/1.1（默认）
+//   'h2'   用 HTTP/2（http2.connect）
+//   'auto' 先看节点 ALPN：给 h2 就用 h2，否则 h1（每个节点多一次 TLS 握手）
+//   'h3'   HTTP/3（QUIC）—— Node 核心没有 QUIC 实现，会退回 auto 并提示
+// 实测提醒：社区里那些「优选 IP」绝大多数只协商 http/1.1（第三方中转/反代只做 h1 转发），
+//   所以默认用 h1，不要白白多花一次握手。
+let PROTOCOL = 'h1';
+export function setProtocol(p) {
+  const v = String(p || '').toLowerCase();
+  PROTOCOL = ['h1', 'h2', 'auto', 'h3'].includes(v) ? v : 'h1';
+  return PROTOCOL;
+}
+export function getProtocol() { return PROTOCOL; }
+
+// ALPN 协商结果缓存（同一 IP 只握手一次）
+const ALPN_CACHE = new Map();
+export function negotiateProtocol(ip, port = 443, timeoutMs = 4000) {
+  const key = `${ip}:${port}`;
+  if (ALPN_CACHE.has(key)) return Promise.resolve(ALPN_CACHE.get(key));
+  return new Promise(resolve => {
+    let done = false;
+    const fin = v => { if (done) return; done = true; ALPN_CACHE.set(key, v); resolve(v); };
+    let sock;
+    try {
+      sock = tls.connect({
+        host: ip, port, servername: SPEED_HOST, rejectUnauthorized: false,
+        ALPNProtocols: ['h2', 'http/1.1']
+      }, () => {
+        const p = sock.alpnProtocol || '';
+        try { sock.destroy(); } catch {}
+        fin(p === 'h2' ? 'h2' : (p ? 'h1' : ''));
+      });
+      sock.setTimeout(timeoutMs, () => { try { sock.destroy(); } catch {} fin(''); });
+      sock.on('error', () => { try { sock.destroy(); } catch {} fin(''); });
+    } catch { fin(''); }
+  });
+}
+
+/**
+ * HTTP/2 版固定时长测速。返回结构与 downloadTimed 完全一致。
+ * 为什么单独写一份而不是复用：Node 的 https.request 永远只说 HTTP/1.1，
+ *   真要跑 h2 必须走 http2.connect，请求与响应事件模型都不同。
+ */
+export function downloadTimedH2(ip, port, durationSeconds = 2.5, warmSeconds = 0.8, onProgress = null) {
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    let ttfb = 0, got = 0, done = false, timer = null, guardTimer = null, colo = '';
+    const timeline = [];
+    let session = null, stream = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (guardTimer) clearTimeout(guardTimer);
+      try { stream && stream.close(); } catch {}
+      try { session && session.destroy(); } catch {}
+    };
+    const fin = (ok, err = '', retryAfter = 0) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      const totalMs = Date.now() - t0;
+      if (!ok) return resolve({ ok: false, err: err || 'failed', retryAfter, totalMs, ttfb, mbps: 0, steadyMbps: 0, peakMbps: 0, ewmaMbps: 0, got, colo, protocol: 'h2' });
+      const warmMs = warmSeconds * 1000;
+      const netSecTotal = (totalMs - ttfb) / 1000;
+      const { steadyMbps, overallMbps, peakMbps, ewmaMbps } = computeSpeedMetrics(timeline, warmMs, netSecTotal, got);
+      resolve({
+        ok: true, err: '', retryAfter: 0, totalMs, ttfb, got, colo, protocol: 'h2',
+        mbps: +steadyMbps.toFixed(2),
+        overallMbps: +overallMbps.toFixed(2),
+        steadyMbps: +steadyMbps.toFixed(2),
+        peakMbps: +peakMbps.toFixed(2),
+        ewmaMbps: +ewmaMbps.toFixed(2),
+        duration: +netSecTotal.toFixed(2)
+      });
+    };
+
+    try {
+      session = http2.connect(`https://${SPEED_HOST}:${port}`, {
+        createConnection: () => tls.connect({
+          host: ip, port, servername: SPEED_HOST, rejectUnauthorized: false, ALPNProtocols: ['h2']
+        })
+      });
+    } catch (e) { return fin(false, e.code || e.message); }
+    session.on('error', e => fin(false, e.code === 'ERR_HTTP2_ERROR' ? 'HTTP2协议错误' : (e.code || e.message)));
+    session.on('goaway', () => fin(false, 'HTTP2-GOAWAY'));
+
+    try {
+      stream = session.request({
+        ':method': 'GET',
+        ':path': withBytes(SPEED_PATH, 52428800),
+        'user-agent': UA,
+        'accept-encoding': 'identity'
+      });
+    } catch (e) { return fin(false, e.code || e.message); }
+
+    stream.on('response', headers => {
+      const status = Number(headers[':status']);
+      if (status !== 200) {
+        const ra = Number(headers['retry-after']);
+        const label = status === 429 ? '限速(429)' : (status === 403 ? '被拒(403)' : 'HTTP ' + status);
+        return fin(false, label, Number.isFinite(ra) && ra > 0 ? ra : 0);
+      }
+      const server = String(headers['server'] || '').toLowerCase();
+      const hasCfRay = !!headers['cf-ray'];
+      colo = String(headers['cf-ray'] || '').split('-').pop() || '';
+      const cType = String(headers['content-type'] || '').toLowerCase();
+      if (!server.includes('cloudflare') && !hasCfRay) return fin(false, '非CF节点');
+      if (cType.includes('text/html')) return fin(false, '返回HTML');
+      // 头一到就开始计时：从此刻起跑满 durationSeconds 就掐断
+      ttfb = Date.now() - t0;
+      timer = setTimeout(() => fin(true), durationSeconds * 1000);
+    });
+    let lastReport = 0;
+    stream.on('data', chunk => {
+      const now = Date.now();
+      got += chunk.length;
+      const relMs = now - (t0 + ttfb);
+      timeline.push({ t: relMs, got });
+      if (onProgress && now - lastReport >= 500) {
+        lastReport = now;
+        const curSec = relMs / 1000;
+        const curMbps = curSec > 0 ? (got * 8) / curSec / 1e6 : 0;
+        try { onProgress({ elapsedSec: +curSec.toFixed(1), targetSec: durationSeconds, curMbps: +curMbps.toFixed(1) }); } catch {}
+      }
+    });
+    stream.on('end', () => fin(true));
+    stream.on('error', e => fin(false, e.code || e.message));
+
+    guardTimer = setTimeout(() => fin(false, 'guard-timeout'), (durationSeconds + 4) * 1000);
+  });
+}
+
+/** 按当前协议设置选一条测速通道（downloadTimedMulti 内部用） */
+async function measureOnce(ip, port, durationSeconds, warmSeconds, onProgress) {
+  const mode = getProtocol();
+  if (mode === 'h1') return downloadTimed(ip, port, durationSeconds, warmSeconds, onProgress);
+  if (mode === 'h2') return downloadTimedH2(ip, port, durationSeconds, warmSeconds, onProgress);
+  if (mode === 'h3') {
+    // Node 核心没有 QUIC/HTTP3 实现（要引 @nodejs/quic 之类的第三方库），如实退回 h1
+    return downloadTimed(ip, port, durationSeconds, warmSeconds, onProgress);
+  }
+  // auto：先看节点给不给 h2
+  const p = await negotiateProtocol(ip, port);
+  return p === 'h2'
+    ? downloadTimedH2(ip, port, durationSeconds, warmSeconds, onProgress)
+    : downloadTimed(ip, port, durationSeconds, warmSeconds, onProgress);
+}
+
+/**
  * 轻量预筛：只下载很小的样本（默认 16KB）来判断节点是否真的能用。
  * 与 download() 的区别：
  *   - 收满 bytes 就立即结束，不等完整响应（因此耗时极短，通常 <1s）
@@ -479,11 +776,11 @@ export function quickProbe(ip, port, bytes = 16384, timeout = 2500) {
       resolve({ ok, ms: Date.now() - t0, ttfb: ok ? ttfb : 0, got, colo, err: err || '' });
     };
     const req = https.request({
-      host: ip, port, path: `/__down?bytes=${bytes}`, method: 'GET',
-      servername: 'speed.cloudflare.com', rejectUnauthorized: false,
-      headers: { Host: 'speed.cloudflare.com', 'User-Agent': UA }
+      host: ip, port, path: withBytes(SPEED_PATH, bytes), method: 'GET',
+      servername: SPEED_HOST, rejectUnauthorized: false,
+      headers: { Host: SPEED_HOST, 'User-Agent': UA, 'Accept-Encoding': 'identity' }
     }, res => {
-      if (res.statusCode !== 200) { res.resume(); return fin(false, 'HTTP ' + res.statusCode); }
+      if (res.statusCode !== 200) { res.resume(); return fin(false, res.statusCode === 429 ? '限速(429)' : 'HTTP ' + res.statusCode); }
       const server = String(res.headers['server'] || '').toLowerCase();
       const hasCfRay = !!res.headers['cf-ray'];
       colo = String(res.headers['cf-ray'] || '').split('-').pop() || '';
@@ -558,6 +855,135 @@ async function dohOnce(url) {
 }
 
 /**
+ * ============ 测速地址（多地址自动探活切换） ============
+ *
+ * 【借鉴自 CFData-WEB】combined_refactor/speed_url.go:17-50
+ *   const autoSpeedURLValue = "auto"
+ *   cmSpeedURL              = "cf.090227.xyz/__down?bytes=99999999"   // 移动专用
+ *   mobileDedicatedSpeedURL = "speed.okl.abrdns.com"
+ *   cloudflareSpeedURL      = "speed.cloudflare.com/__down?bytes=99999999"
+ *   pickAutoSpeedURL()  →  是 "auto" 就先试当前默认，不行再 firstAvailableSpeedURL(...)
+ *   它把测速地址做成可切换的：某个地址被墙/被限速/被弃用，不至于让整轮优选白跑。
+ *
+ * 本地实测印证了它的价值：同一时刻 speed.cloudflare.com 返回 200，
+ *   而 cf.xiu2.xyz / cf.090227.xyz 返回 403，speed.okl.abrdns.com 仍能正常下载。
+ */
+export const SPEED_URL_AUTO = 'auto';
+
+export const SPEED_URL_CANDIDATES = [
+  { url: 'https://speed.cloudflare.com/__down?bytes=52428800', name: 'Cloudflare 官方' },
+  { url: 'https://cf.090227.xyz/__down?bytes=99999999', name: '移动专用' },
+  { url: 'https://speed.okl.abrdns.com', name: '备用' }
+];
+
+// 测速请求的 Host / path 由这里统一给出，避免散落在多处写死
+let SPEED_HOST = 'speed.cloudflare.com';
+let SPEED_PATH = '/__down?bytes=52428800';
+
+/** 把用户写的地址规整成 {host, path}；写得不成 URL 就返回 null */
+export function splitSpeedUrl(u) {
+  if (!u) return null;
+  try {
+    const s = String(u);
+    const x = new URL(s.includes('://') ? s : 'https://' + s);
+    if (!x.hostname) return null;
+    return { host: x.hostname, path: (x.pathname || '/') + (x.search || '') };
+  } catch { return null; }
+}
+
+/** 把 path 里的 bytes= 换成指定值（地址本身没有 bytes 参数就原样返回） */
+export function withBytes(path, bytes) {
+  return /[?&]bytes=\d+/.test(String(path)) ? String(path).replace(/([?&]bytes=)\d+/, `$1${bytes}`) : path;
+}
+
+export function setSpeedUrl(u) {
+  const p = splitSpeedUrl(u);
+  if (!p) return false;
+  SPEED_HOST = p.host;
+  SPEED_PATH = p.path;
+  return true;
+}
+
+export function getSpeedUrl() { return `https://${SPEED_HOST}${SPEED_PATH}`; }
+export function getSpeedHost() { return SPEED_HOST; }
+export function getSpeedPath() { return SPEED_PATH; }
+
+/**
+ * 自动挑一个能用的测速地址（CFData-WEB pickAutoSpeedURL 的等价实现）。
+ *   pref 写具体地址 → 直接用，不猜
+ *   pref 为 "auto" / 空 → 按候选顺序探活，第一个通的就用
+ *   全都不同 → 回退官方地址并让调用方给出警告（不让整轮白跑，但把话说清楚）
+ */
+export async function pickAutoSpeedUrl(pref, log = () => {}) {
+  if (pref && pref !== SPEED_URL_AUTO && splitSpeedUrl(pref)) {
+    setSpeedUrl(pref);
+    return { url: getSpeedUrl(), name: '配置指定', picked: false };
+  }
+  for (const c of SPEED_URL_CANDIDATES) {
+    const r = await probeSpeedEndpoint(5000, c.url);
+    if (r.ok) {
+      setSpeedUrl(c.url);
+      return { url: getSpeedUrl(), name: c.name, picked: c.url !== SPEED_URL_CANDIDATES[0].url, probe: r };
+    }
+    log(`   测速地址探活失败：${c.name} ${c.url}（${r.err || 'HTTP ' + r.code}）`);
+  }
+  setSpeedUrl(SPEED_URL_CANDIDATES[0].url);
+  return { url: getSpeedUrl(), name: 'Cloudflare 官方', picked: false, allDead: true };
+}
+
+/**
+ * 测速端点探活：确认这个测速地址到底下不下得动。
+ *
+ * 为什么需要它（借鉴 CFData-WEB `combined_refactor/speed_url.go:258-296` 的 checkSpeedURLAvailability）：
+ *   整轮优选的每一秒都建立在「能连上测速端点」这个前提上。
+ *   一旦换到被污染的网络、或 CF 调整了测速端点，程序仍会跑满几分钟，
+ *   最后报「一个节点都不达标」—— 把「测速通道不通」误报成「所有节点都很差」。
+ *   所以开跑前用 1KB 小样本探一次，不通就当场讲清楚，不白白浪费你的时间。
+ *
+ * 判定：HTTP 2xx 且真的读到字节；5 秒超时（与它一致）。
+ * @param {number} timeoutMs
+ * @param {string|null} url 不传就探当前生效的地址
+ * @returns {Promise<{ok:boolean, code?:number, bytes?:number, ms:number, err?:string}>}
+ */
+export function probeSpeedEndpoint(timeoutMs = 5000, url = null) {
+  const target = splitSpeedUrl(url) || { host: SPEED_HOST, path: SPEED_PATH };
+  return new Promise(resolve => {
+    const t0 = Date.now();
+    let settled = false;
+    let req = null;
+    const fin = v => {
+      if (settled) return;
+      settled = true;
+      try { req && req.destroy(); } catch { /* 忽略 */ }
+      resolve({ ...v, ms: Date.now() - t0 });
+    };
+    req = https.request({
+      host: target.host, port: 443, path: withBytes(target.path, 1024), method: 'GET',
+      headers: { 'User-Agent': UA, 'Accept-Encoding': 'identity' },
+      rejectUnauthorized: false,
+      timeout: timeoutMs
+    }, res => {
+      let n = 0;
+      res.on('data', c => {
+        n += c.length;
+        // 有的备用地址没有 bytes= 参数（例如 speed.okl.abrdns.com 直接吐一个大文件，
+        //   实测能下 100MB），探活只需要「能拿到字节」这一个证据 ——
+        //   读到 64KB 就主动断开，别为了探活把整个文件拖下来。
+        if (n >= 65536) fin({ ok: res.statusCode >= 200 && res.statusCode < 300 && n > 0, code: res.statusCode, bytes: n });
+      });
+      res.on('end', () => fin({
+        ok: res.statusCode >= 200 && res.statusCode < 300 && n > 0,
+        code: res.statusCode, bytes: n
+      }));
+      res.on('error', e => fin({ ok: false, err: e.code || e.message }));
+    });
+    req.on('error', e => fin({ ok: false, err: e.code || e.message }));
+    req.on('timeout', () => fin({ ok: false, err: 'timeout' }));
+    req.end();
+  });
+}
+
+/**
  * 链路复验（relink）：用你自己的站点域名，真实访问一次候选 IP。
  *
  * 为什么需要它：测速阶段连的是 speed.cloudflare.com/__down，只能证明"这个 IP 能下载 CF 的测速文件"，
@@ -592,12 +1018,26 @@ export function relinkCheck(ip, domain, timeoutMs = 6000, port = 443) {
       timeout: timeoutMs
     }, res => {
       let n = 0;
-      res.on('data', c => { n += c.length; });
-      res.on('end', () => fin({
-        ok: res.statusCode === 200 && n > 0,
-        code: res.statusCode, bytes: n,
-        colo: String(res.headers['cf-ray'] || '').split('-').pop() || ''
-      }));
+      const head = [];
+      let headLen = 0;
+      res.on('data', c => {
+        n += c.length;
+        if (headLen < 2048) { head.push(c); headLen += c.length; }
+      });
+      res.on('end', () => {
+        // 【不信任 200】借鉴 CFData-WEB `combined_refactor/tasks_nsb.go:937-939` 的思路：
+        //   它的链路复验除状态码外还要求响应体确实来自目标服务。
+        //   这里同理 —— CF 边缘在链路异常时也会回 200 + 一页错误说明，
+        //   光看状态码会把「打得开但打不到你站点」的节点当成好的。
+        const text = Buffer.concat(head).toString('utf8');
+        const looksCfError = /cf-error-details|error code:?\s*1\d{3}|<title>[^<]*\b(Error|错误)\b/i.test(text);
+        fin({
+          ok: res.statusCode === 200 && n > 0 && !looksCfError,
+          code: res.statusCode, bytes: n,
+          err: (res.statusCode === 200 && n > 0 && looksCfError) ? 'CF错误页' : undefined,
+          colo: String(res.headers['cf-ray'] || '').split('-').pop() || ''
+        });
+      });
       res.on('error', e => fin({ ok: false, err: e.code || e.message }));
     });
     req.on('error', e => fin({ ok: false, err: e.code || e.message }));

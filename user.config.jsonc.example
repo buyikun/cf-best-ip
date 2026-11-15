@@ -87,8 +87,8 @@
        * tier:"legacy" 的源会被排在后面测（适合更新慢的老源）。 */
       { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/xinyitang3/ipv4.txt", "tier": "fresh", "name": "Mia优选(港/新/韩/日/美)" },
       { "url": "https://raw.githubusercontent.com/free-nodes/bestcf/main/tiancheng/all.txt",   "tier": "fresh", "name": "天诚优选1(港/新/韩/日/美/台/德)" },
-      { "url": "https://api.uouin.com/cloudflare.html",                                     "tier": "fresh", "name": "麒麟优选(HTML,运营商分组)" },
-      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt",                                 "tier": "fresh", "name": "junzhen北京电信" }
+      { "url": "https://cf.junzhen.qzz.io/full_ips_bj.txt",                                 "tier": "fresh", "name": "junzhen北京电信" },
+      { "url": "https://776771.xyz/all.txt",                                                "tier": "fresh", "name": "776771优选(港/新/日/美/韩/台)" }
     ],
     "merge": true,            /* true=合并所有源；false=只用第一个能拉到的 */
     "preferUrl": true,        /* true=优先线上订阅，全失败才用本地缓存 */
@@ -106,6 +106,66 @@
     /* ★「IP 可用」阈值(Mbps)：8 足够流畅看 1080p。
      *   调高更挑但更换更频繁；填 0 则按你本地带宽自动校准。 */
     "targetMbps": 8,
+
+    /* ★最低速度门槛（Mbps）：按「复核里最差的那一轮」判定 —— 低于此值的一律不要。
+     *   为什么看最低值而不是中位数：中位速度漂亮、但某一轮掉到很低的节点（波动大），
+     *   写进 DNS 后就是"时快时卡"，正是最该避免的那种。
+     *   若所有节点都低于此值，本轮只取速度最高的 1 个保底，不会凑满 uploadCount 个。
+     *   填 0 = 关闭该门槛。例：填 60 表示"任何一轮都不能低于 60Mbps"。 */
+    "acceptMinMbps": 0,
+
+    /* ★多连接测速：同一个 IP 同时开几条连接，速度取这几条连接的合计。
+     *   为什么要多条：单条 TCP 连接常被流控限制，吃不满节点实际能给到的带宽，
+     *   于是「单连接测出来的速度」会系统性偏低（实测有的节点 4 连接比单连接快 6 倍，
+     *   单连接只有 4.9Mbps 会被 8Mbps 达标线误判成不合格，实际 4 连接能跑 32Mbps）。
+     *   浏览器看视频/下载本身也是多连接，所以多连接口径更接近真实体验。
+     *   填 1 = 退回单连接（旧行为）。太大可能触发 Cloudflare 限速（日志会显示「限速(429)」），
+     *   一般 4 个够用，程序内部最多允许 16。 */
+    "connections": 4,
+
+    /* ★判定用哪个速度值：
+     *   "steady" = 稳态均值（默认）—— 剥离慢启动后的平均速度，代表"长期能稳住多少"。
+     *   "peak"   = 1 秒滑动窗口峰值  —— 代表"这个节点最好能跑多快"。
+     *   "ewma"   = 指数加权滑动平均（借鉴 XIU2/CloudflareSpeedTest）—— 按 100ms 小片加权，
+     *              对慢启动更宽容，实测比 steady 更接近真实上限。
+     *   三者差别不小（实测有节点均值 32.9Mbps、峰值 69.2Mbps，差 2.1 倍）。
+     *   在线看视频更看重"能不能稳住"，一般用默认的 steady 即可。
+     *   为什么不看瞬时采样间隔：内核缓冲/重传会把单次采样的字节数打散，
+     *   用它做除数会得到 0 和尖峰交替的读数，所以用固定 1 秒窗口抹平抖动。 */
+    "speedMetric": "steady",
+
+    /* ★用哪个地址测速（借鉴 CFData-WEB 的多地址自动切换）：
+     *   "auto" = 程序按顺序探活下面三个候选，用第一个通的（默认，推荐）。
+     *   也可以直接填一个完整 URL，程序就固定用它。
+     *   候选与用途：
+     *     https://speed.cloudflare.com/__down?bytes=52428800  Cloudflare 官方（默认）
+     *     https://cf.090227.xyz/__down?bytes=99999999         移动专用线路
+     *     https://speed.okl.abrdns.com                        备用（无 bytes 参数，是个大文件）
+     *   注意：换测速地址**不能**解除「限速(429)」。429 是节点级的，是同一个节点被反复
+     *   请求后自己限流，跟用哪个地址无关（实测换地址在这些节点上照样 403/429）。 */
+    "speedUrl": "auto",
+
+    /* ★遇到 Cloudflare 限速（429）时怎么办（借鉴 CFST-GUI）：
+     *   true （默认）= 只要有连接被限速，这一轮测速就判为**无效**，该节点不参与排名。
+     *   false        = 只标注「⚠限速(N条)」，仍按剩下的连接算速度参加排名。
+     *   为什么默认判无效：多连接测速是「把几条连接的速度加起来」，如果 4 条里 3 条吃 429，
+     *   合计值就只是 1 条连接的速度 —— 这不是「这个节点有多快」，而是「我们被限流了」。
+     *   实测同一个节点在 57Mbps 和 162Mbps 之间乱跳就是这个原因。
+     *   （CFST-GUI 的选择是读 Retry-After 退避后重试；实测我们的 Retry-After 长达 37~60 分钟，
+     *     等不起，所以换成「本轮判无效、下轮再看」。） */
+    "limitedAsFail": true,
+
+    /* ★测速走哪个 HTTP 协议（借鉴 CFST-GUI 的 ProtocolAuto）：
+     *   "h1"   = 只用 HTTP/1.1（默认）—— 现在的测速端点本来就只给 h1，选它最省一次握手。
+     *   "h2"   = 用 HTTP/2（多路复用，一个连接跑多条流）。
+     *   "auto" = 每个节点先做一次 TLS ALPN 协商，节点支持 h2 才走 h2。
+     *   "h3"   = 暂不支持（Node 核心没有 QUIC 实现，程序会如实按 h1 跑并在日志里说明）。
+     *   实测结论：speed.cloudflare.com 这个官方测速端点**本身只提供 HTTP/1.1**，
+     *   所以当前配置下 h2 不会生效 —— 这不是程序的问题（用 www.cloudflare.com /
+     *   www.google.com 试，ALPN 都能正确协商出 h2）。
+     *   如果你把上面的 speedUrl 换成一个支持 h2 且有大文件的地址，再选 "auto" 就能用上。 */
+    "protocol": "h1",
+
     "targetRatio": 0.6667,    /* 自动模式：本地带宽 × 该比例 */
     "targetMaxMbps": 20,      /* 自动模式的封顶值 */
     "targetTtlDays": 30,      /* 校准值多少天后重测 */
@@ -187,6 +247,12 @@
     "verifyWarmSec": 0.8,     /* 剥离前 0.8 秒慢启动，测定真实极限稳态速度 */
 
     "minMedianMbps": 1.0,     /* 中位速度低于此值淘汰 */
+    "acceptMinMbps": 0,       /* ★最低速度门槛：最差一轮低于此值的一律不要；全低时只取最快 1 个保底。0 = 关闭 */
+    "connections": 4,         /* ★多连接测速：同 IP 同时开几条连接，速度取合计；1 = 单连接。作用见 fast 段说明 */
+    "speedMetric": "steady",  /* ★判定速度口径：steady = 稳态均值 / peak = 1 秒滑动窗口峰值 / ewma = 指数加权滑动平均。见 fast 段说明 */
+    "speedUrl": "auto",       /* ★测速地址：auto = 自动探活切换（推荐）或填完整 URL。见 fast 段说明 */
+    "limitedAsFail": true,    /* ★遇 429 限速时本轮测速是否判无效：true = 判无效不参与排名（推荐）。见 fast 段说明 */
+    "protocol": "h1",         /* ★测速协议：h1（默认）/ h2 / auto（看 ALPN 协商）/ h3（暂不支持）。见 fast 段说明 */
     "minOkRate": 0.5          /* 成功率低于此值淘汰 */
   },
 
@@ -288,7 +354,7 @@
  *  提示：不写 filter 或 tokens 为空，效果是一样的——都不筛选。
  *  多数情况下你不需要设置它，让程序自己测速挑最快的就行。
  *
- *  ⚠ 注意：麒麟优选（HTML 表格源）没有国家码，它的那一列放的是
+ *  ⚠ 注意：HTML 表格类的源（运营商分组表）没有国家码，它那一列放的是
  *    运营商分组，程序会转成下面这 4 个代号：
  *        TEL = 电信    UNI = 联通    CMB = 移动    MUL = 多线
  *    所以 filter 里写 TEL/UNI/CMB/MUL 可以按运营商筛选，

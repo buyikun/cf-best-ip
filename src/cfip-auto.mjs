@@ -17,7 +17,7 @@ import path from 'node:path';
 import net from 'node:net';
 import https from 'node:https';
 import { fileURLToPath } from 'node:url';
-import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib, quickProbe, download, downloadTimed, pool, median, relinkCheckRetry } from './cfip-lib.mjs';
+import { pruneOldFiles, loadConfig, findBaseDir, loadSource as loadSourceLib, quickProbe, download, downloadTimed, downloadTimedMulti, pool, median, relinkCheckRetry, probeSpeedEndpoint, pickAutoSpeedUrl, setProtocol } from './cfip-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = findBaseDir(HERE);   // 根目录（配置与 var\ 所在层），程序可放在 src\ 子目录
@@ -249,6 +249,21 @@ try {
   const prL = pruneOldFiles(LOG_DIR, /^cfip-.*\.log$/, keepLog, null);
   if (prB || prL) log(`已清理历史文件：备份 ${prB} 个、日志 ${prL} 个（各保留最近 ${keepBak} 份）`);
 
+  // 0. 测速端点探活：先确认 speed.cloudflare.com 下得动
+  //    （借鉴 CFData-WEB `combined_refactor/speed_url.go:258-296` 的 checkSpeedURLAvailability）
+  //    不通就当场讲清楚，免得预筛跑几分钟后把「通道不通」误报成「所有节点都很差」。
+  {
+    const pu = await pickAutoSpeedUrl(cfg.probe.speedUrl, log);
+    if (pu.allDead) {
+      log(`测速地址：${pu.url}（全部候选都不通，已回退默认）`);
+      log(`   ⚠ 测速地址探测失败 —— 若下面预筛全军覆没，多半是本机到 Cloudflare 的通道不通，不是节点的问题`);
+    } else if (pu.picked) {
+      log(`测速地址：${pu.url}（${pu.name} —— 默认地址探活失败，已自动切换）`);
+    } else {
+      log(`测速地址：${pu.url}（${pu.name}${pu.probe ? `，取到 ${pu.probe.bytes}B，${pu.probe.ms}ms` : ''}）${PROTO !== 'h1' ? `  ｜测速协议 ${PROTO}${PROTO === 'h3' ? '（Node 核心没有 QUIC 实现，实际按 h1 跑）' : ''}` : ''}`);
+    }
+  }
+
   // 1. 源
   const all = await loadSource();
   log(`源记录：${all.length} 条`);
@@ -276,6 +291,15 @@ try {
     return false;
   };
   const P = Number(cfg.probe.port);
+  // 多连接测速的连接数（1 = 退回单连接）。借鉴 CFST-GUI internal/task/download.go:34。
+  const CONN = Math.max(1, Math.min(16, Math.floor(Number(cfg.probe.connections ?? 4)) || 1));
+  // 判定用哪个速度值：steady（稳态均值）/ peak（1 秒滑动窗口峰值）。借鉴 CFST-GUI internal/utils/csv.go:183-191。
+  // 判定速度口径：steady = 稳态均值（默认）/ peak = 1 秒滑动窗口峰值 / ewma = 指数加权平均（借鉴 XIU2）
+  const METRIC = ['peak', 'ewma'].includes(String(cfg.probe.speedMetric || 'steady').toLowerCase()) ? String(cfg.probe.speedMetric).toLowerCase() : 'steady';
+  // 【借鉴 CFST-GUI】429 = 无效结果（见 cfip-lib.mjs 的说明）：有连接被限速就判这一轮无效。
+  const LIMFAIL = cfg.probe.limitedAsFail !== false;
+  // 测速协议（借鉴 CFST-GUI 的 Protocol*）：h1（默认）/ h2 / auto（看 ALPN）/ h3（Node 无 QUIC，按 h1 跑）
+  const PROTO = setProtocol(cfg.probe.protocol);
   const allRows = all.map(r => ({ ...r, port: P, wanted: wantedByAny(r.cc) ? 1 : 0 }));
   const wantedRows = allRows.filter(r => r.wanted);
   // 【安全阀】filter 一个都没命中时绝不照做 —— 那会让本轮没有任何候选，
@@ -344,14 +368,22 @@ try {
   log(`---- 阶段2/3：初测 ${testList.length} 个幸存者（每节点严格跑 1.5 秒硬掐断，绝不死等）----`);
 
   let initIdx = 0;
+  // 【限速可见性】初测与复核共用一个集合：任何阶段吃到 429/403 的节点都记下来，
+  //   否则「全军覆没」时日志只有一堆「失败」，分不清是节点慢还是我们被限流了。
+  const limitedIps = new Set();
   for (const c of testList) {
     initIdx++;
-    const d = await downloadTimed(c.ip, c.port, 1.5, 0.4, p => {
+    const d = await downloadTimedMulti(c.ip, c.port, 1.5, 0.4, CONN, p => {
       log(`   初测 [${initIdx}/${testList.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
-    });
+    }, METRIC, LIMFAIL);
     (c.samples ||= []).push(d);
+    if (!d.ok && /限速\(429\)|被拒\(403\)/.test(String(d.err))) limitedIps.add(c.ip);
   }
   log(`初测完成：${testList.length} 个`);
+  if (limitedIps.size) {
+    log(`⚠ 初测里有 ${limitedIps.size} 个节点被 Cloudflare 限速/拒绝（429/403）—— 这是「此刻被我们打限流了」，不是「节点本身慢」：`);
+    log(`   ${[...limitedIps].slice(0, 8).join(', ')}${limitedIps.size > 8 ? ` …（共 ${limitedIps.size} 个）` : ''}`);
+  }
 
   // 5. 阶段3：对初测排名靠前的再复核若干轮（固定跑 3.0 秒，剥离 0.8s 慢启动求稳态极限）
   const verifyTop = Math.max(1, Number(cfg.probe.verifyTopN ?? 15));
@@ -376,28 +408,80 @@ try {
       let j = 0;
       for (const c of verifyList) {
         j++;
-        const d = await downloadTimed(c.ip, c.port, 3.0, 0.8, p => {
+        const d = await downloadTimedMulti(c.ip, c.port, 3.0, 0.8, CONN, p => {
           log(`   复核 第${r}轮 [${j}/${verifyList.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
-        });
+        }, METRIC, LIMFAIL);
         (c.samples ||= []).push(d);
+        if (Number(d.limitedCount) > 0) limitedIps.add(c.ip);
+        const wait = Number(d.retryAfter) > 0 ? `，需等待约 ${Math.round(Number(d.retryAfter) / 60)} 分钟` : '';
+        const partial = Number(d.limitedCount) > 0 ? `（${d.connections} 条连接里有 ${d.limitedCount} 条被限速）` : '';
+        const st = d.ok ? `${d.mbps}Mbps (稳态)${partial}` : `失败(${d.err}${wait})`;
+        log(`   复核 第${r}轮 [${j}/${verifyList.length}] ${c.ip.padEnd(15)} → ${st}`);
       }
       log(`复核第 ${r}/${verifyRounds} 轮完成`);
+    }
+    if (limitedIps.size) {
+      log(`⚠ 有 ${limitedIps.size} 个节点被 Cloudflare 限速/拒绝（429/403）—— 这是「此刻被限流」，不是「节点本身慢」，本轮已跳过：`);
+      log(`   ${[...limitedIps].slice(0, 8).join(', ')}${limitedIps.size > 8 ? ` …（共 ${limitedIps.size} 个）` : ''}`);
     }
   }
 
   const screened = testList;
 
-  // 6. 中位数排名（候选池已按 filter 前置排除，这里只按实测速度排）
+  // 6. 中位数排名（候选池已按 filter 前置排除；此处按「成功率 → 综合得分」排序）
+  const minSpeed = cfg.probe.minMedianMbps;
+  const JITTER_W = 2.0;   // 波动惩罚权重（见下方排序注释）
   const ranked = screened.map(c => {
     const ok = c.samples.filter(s => s.ok);
-    const mbps = median(ok.map(s => s.mbps));
-    return { ...c, mbps, ttfb: median(ok.map(s => s.ttfb)), okRate: ok.length / c.samples.length };
-  }).filter(r => r.okRate >= cfg.probe.minOkRate && r.mbps >= cfg.probe.minMedianMbps)
-    .sort((a, b) => (b.mbps - a.mbps) || (a.ttfb - b.ttfb));
+    const vals = ok.map(s => s.mbps);
+    const mbps = median(vals);
+    const minMbps = vals.length ? Math.min(...vals) : 0;
+    const maxMbps = vals.length ? Math.max(...vals) : 0;
+    const jitter = maxMbps > 0 ? (maxMbps - minMbps) / maxMbps : 0;   // 0 = 各轮完全一致
+    // 综合得分：速度 ÷ 波动惩罚。借鉴 cfnb 的 MIT 公式 `score = SPEED_WEIGHT*speed / penalty`
+    //（它算的是延迟抖动 penalty = 1 + w*jitter，这里把抖动换成「速度的相对波动」）
+    const score = +(mbps / (1 + JITTER_W * jitter)).toFixed(2);
+    return {
+      ...c, mbps,
+      ttfb: median(ok.map(s => s.ttfb)),
+      minMbps, maxMbps, jitter, score,
+      // 复核期间只要有一条连接被限速，这次测出来的速度就是被削过的（多连接「一条成功即算成功」
+      //   会把 429 悄悄藏起来），所以给这类节点打标，排序时让位给干净节点。
+      limited: (c.samples || []).some(s => Number(s.limitedCount) > 0) ? 1 : 0,
+      limitedCount: (c.samples || []).reduce((a, s) => a + (Number(s.limitedCount) || 0), 0),
+      okRate: ok.length / c.samples.length
+    };
+  }).filter(r => r.okRate >= cfg.probe.minOkRate && r.mbps >= minSpeed)
+    // 【排序：成功率 → 是否被限速 → 综合得分（速度÷波动）】与快速模式同一套思路，
+    //   框架来自 CFData-WEB 的 sortNSBResults（combined_refactor/tasks_nsb.go:395-421：
+    //   speedQualified↓ → lossRate↓ → downloadSpeed↓ → tcpDuration↑）。
+    //   但它的第二主键（丢包率）在本项目几乎恒为 100% —— CF 节点很少真的失败，只是忽快忽慢，
+    //   所以再补一层波动惩罚，避免选出「某一轮飙高、下一轮趴窝」的节点。
+    .sort((a, b) => {
+      if (b.okRate !== a.okRate) return b.okRate - a.okRate;           // 1) 成功率高的优先（CFData-WEB 原主键）
+      if (a.limited !== b.limited) return a.limited - b.limited;       // 2) 复核时没被限速的优先
+      return b.score - a.score || b.mbps - a.mbps || a.ttfb - b.ttfb;  // 3) 综合得分 → 速度 → 延迟
+    });
 
   log(`合格节点：${ranked.length} 个（要求 ok率≥${cfg.probe.minOkRate}，中位速度≥${cfg.probe.minMedianMbps}Mbps）`);
-  for (const r of ranked.slice(0, 12)) log(`   ${r.ip.padEnd(16)} ${r.cc} ${String(r.mbps).padStart(6)}Mbps  ttfb=${r.ttfb}ms  ok=${Math.round(r.okRate * 100)}%`);
+  for (const r of ranked.slice(0, 12)) log(`   ${r.ip.padEnd(16)} ${r.cc} ${String(r.mbps).padStart(6)}Mbps  ttfb=${String(r.ttfb).padStart(4)}ms  稳定${String(Math.round(r.okRate * 100)).padStart(3)}% 波动${String(Math.round(r.jitter * 100)).padStart(3)}%  最低${String(r.minMbps).padStart(6)}Mbps${r.limited ? '  ⚠限速' : ''}`);
   if (!ranked.length) throw new Error('没有节点通过质量门槛，保留现有 DNS 记录不变');
+
+  // 【最低速度门槛 acceptMinMbps】与快速模式同一套规则：只保留「最差一轮也够快」的节点。
+  //   看最低值而不是中位数 —— 中位漂亮但某一轮掉很低的节点，上线后就是"时快时卡"。
+  //   若一个都不剩，退而取中位速度最高的 1 个保底，本轮不凑满 topN。
+  const minFloor = Math.max(0, Number(cfg.probe.acceptMinMbps ?? 0));
+  let rankedOut = ranked;
+  if (minFloor > 0) {
+    const passFloor = ranked.filter(r => r.minMbps >= minFloor);
+    if (passFloor.length) {
+      rankedOut = passFloor;
+      log(`最低速度门槛 ${minFloor}Mbps：${ranked.length} 个候选里 ${passFloor.length} 个通过（剔除 ${ranked.length - passFloor.length} 个最差一轮不够快的）`);
+    } else {
+      rankedOut = [...ranked].sort((a, b) => b.mbps - a.mbps).slice(0, 1);
+      log(`最低速度门槛 ${minFloor}Mbps：${ranked.length} 个候选全部低于此值 —— 只取速度最高的 1 个保底（${rankedOut[0]?.ip || '无'}），本轮不凑满 topN`);
+    }
+  }
 
   // 6. 逐记录出方案（带链路复验）
   //    【为什么必须复验】测速走的是 speed.cloudflare.com 这个通道，
@@ -416,7 +500,7 @@ try {
   for (const rec of (cfg.cloudflare.records || [])) {
     // 全量模式沿用每个域名自己的 topN（不做全局硬上限，这一点和快速模式不同）
     const limit = Math.max(1, Number(rec.topN ?? 3));
-    const candidates = applyFilter(ranked, rec.filter);
+    const candidates = applyFilter(rankedOut, rec.filter);
     const picked = [];
     const triedIps = new Set();
     const maxTry = Math.min(candidates.length, Math.max(limit * 4, limit + 5));

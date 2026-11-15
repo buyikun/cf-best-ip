@@ -23,8 +23,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  createLogger, loadSource, download, downloadTimed, quickProbe, pool, median,
-  createCf, dohCheck, applyFilter, readJson, writeJson, relinkCheckRetry,
+  createLogger, loadSource, download, downloadTimed, downloadTimedMulti, quickProbe, pool, median,
+  createCf, dohCheck, applyFilter, readJson, writeJson, relinkCheckRetry, probeSpeedEndpoint, pickAutoSpeedUrl, setProtocol,
   measureLocalBandwidth, getNetworkProfile, readProfileStore, saveProfileStore, pruneOldFiles, loadConfig, findBaseDir
 } from './cfip-lib.mjs';
 
@@ -67,6 +67,16 @@ const F = {
   bandwidthCacheFile: 'var/bandwidth.json', bandwidthCacheHours: 24, bandwidthSeconds: 4,
   targetMbps: 0, targetTtlDays: 30, healthCheck: true, qualityGuard: true, guardRatio: 0.5,
   fallbackAfterProbes: 30, localBandwidthMbps: 0,
+  // 单 IP 同时开几条连接测速。单条 TCP 常被流控限制，吃不满节点实际能给到的带宽；
+  //   浏览器看视频本身也是多连接，所以多连接口径更接近真实体验（实测有些节点差 6 倍）。
+  //   借鉴 CFST-GUI internal/task/download.go:34（defaultDownloadGetConcurrency = 4）。
+  //   设为 1 即退回原来的一次一条连接。
+  connections: 4,
+
+  // 判定用哪个速度值：'steady' = 稳态均值（默认），'peak' = 1 秒滑动窗口峰值。
+  //   峰值更接近"这个节点最好能跑多快"，均值更接近"长期能稳住多少"。
+  //   借鉴 CFST-GUI internal/utils/csv.go:183-191（DownloadSpeedForMetric 支持 max/avg 两种口径）。
+  speedMetric: 'steady',
   // 阶段1 并发预筛参数（轻量样本，只判断是否真能用，不追求速度准确）
   screenBytes: 16384, screenConcurrency: 8, screenTimeoutMs: 2500,
   sourceStatFile: 'var/source-stats.json', sourceStatTtlDays: 14, sourceStatWarmup: 30,
@@ -76,6 +86,18 @@ if (opt('--target')) F.targetMbps = optNum('--target', F.targetMbps, 0.1, 10000)
 if (opt('--ratio')) F.targetRatio = optNum('--ratio', F.targetRatio, 0.05, 1);
 if (opt('--probe')) F.maxProbe = optNum('--probe', F.maxProbe, 1, 100000);
 if (flag('--skip-health')) F.healthCheck = false;
+
+// 多连接测速的连接数（1 = 退回单连接，行为与旧版完全一致）
+const CONN = Math.max(1, Math.min(16, Math.floor(Number(F.connections)) || 1));
+// 判定用哪个速度值：steady（稳态均值）/ peak（1 秒滑动窗口峰值）
+// 判定速度口径：steady = 稳态均值（默认）/ peak = 1 秒滑动窗口峰值 / ewma = 指数加权平均（借鉴 XIU2）
+const METRIC = ['peak', 'ewma'].includes(String(F.speedMetric || 'steady').toLowerCase()) ? String(F.speedMetric).toLowerCase() : 'steady';
+// 【借鉴 CFST-GUI】它把 429 当「无效结果」（internal/task/download.go:492 invalidDownloadResultWithRetryAfter），
+//   我们的等价做法：只要有连接被限速，这一轮测速就判无效，不参与排名（详见 cfip-lib.mjs 里的说明）。
+const LIMFAIL = F.limitedAsFail !== false;
+// 测速协议（借鉴 CFST-GUI internal/httpclient/client.go:25-29 的 Protocol*）：
+//   h1（默认）= 只用 HTTP/1.1；h2 = HTTP/2；auto = 先看节点 ALPN 再决定；h3 = Node 核心无 QUIC，按 h1 跑。
+const PROTO = setProtocol(F.protocol);
 
 const CFG_DIR = BASE;
 const LOG_DIR = path.resolve(CFG_DIR, cfg.behavior.logDir || 'var/logs');
@@ -148,7 +170,20 @@ try {
   const prL = pruneOldFiles(LOG_DIR, /^cfip-.*\.log$/, keepLog, null);
   if (prB || prL) log(`已清理历史文件：备份 ${prB} 个、日志 ${prL} 个（各保留最近 ${keepBak} 份）`);
 
-  // 0. 网络指纹 + 历史
+  // 0. 测速端点探活 + 网络指纹 + 历史
+  //    先确认 speed.cloudflare.com 下得动（借鉴 CFData-WEB `speed_url.go:258-296` 的 checkSpeedURLAvailability）。
+  //    不通就当场讲清楚，免得跑满几分钟后把「通道不通」误报成「所有节点都很差」。
+  {
+    const pu = await pickAutoSpeedUrl(F.speedUrl, log);
+    if (pu.allDead) {
+      log(`测速地址：${pu.url}（全部候选都不通，已回退默认）`);
+      log(`   ⚠ 测速地址探测失败 —— 若下面所有节点都是 0Mbps，多半是本机到 Cloudflare 的通道不通，不是节点的问题`);
+    } else if (pu.picked) {
+      log(`测速地址：${pu.url}（${pu.name} —— 默认地址探活失败，已自动切换）`);
+    } else {
+      log(`测速地址：${pu.url}（${pu.name}${pu.probe ? `，取到 ${pu.probe.bytes}B，${pu.probe.ms}ms` : ''}）${PROTO !== 'h1' ? `  ｜测速协议 ${PROTO}${PROTO === 'h3' ? '（Node 核心没有 QUIC 实现，实际按 h1 跑）' : ''}` : ''}`);
+    }
+  }
   log('正在识别网络指纹（探测本地宽带出口）…');
   const net = await getNetworkProfile(log);
   const hist = readJson(HISTORY_FILE, { ips: {} });
@@ -224,7 +259,7 @@ try {
     for (const ip of curIps) {
       const samples = [];
       for (let r = 0; r < healthRounds; r++) {
-        samples.push(await downloadTimed(ip, P, 2.5, 0.8));
+        samples.push(await downloadTimedMulti(ip, P, 2.5, 0.8, CONN, null, METRIC, LIMFAIL));
       }
       const best = samples.filter(s => s.ok).sort((a, b) => b.mbps - a.mbps)[0];
       const ok = !!best && best.mbps >= target;
@@ -395,6 +430,9 @@ try {
   const testQueue = survivors;   // 只对存活者做精测
 
   // ── 阶段2：串行精测 + 早停 ─────────────────────────────────────
+  // 【限速可见性】精测阶段也要统计被 429/403 打掉的节点 —— 否则「全军覆没」时
+  //   日志只会显示一堆「失败」，看不出是节点真慢还是我们被 Cloudflare 限流了。
+  const limitedEarly = new Set();
   await pool(testQueue, Math.max(1, Number(F.probeConcurrency)), async c => {
     if (stopped) return;
     if (Date.now() > deadline) { if (!stopped) { stopped = true; log(`   ! 达到时间上限 ${F.maxSeconds}s，停止探测`); } return; }
@@ -409,9 +447,9 @@ try {
     }
     // 阶段2 精测：每节点固定跑 1.5 秒，时间一到硬斩断，绝不死等拖延！
     const idx = tested.size + 1;
-    const d = await downloadTimed(c.ip, c.port, 1.5, 0.4, p => {
+    const d = await downloadTimedMulti(c.ip, c.port, 1.5, 0.4, CONN, p => {
       log(`   精测 [${idx}/${testQueue.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
-    });
+    }, METRIC, LIMFAIL);
     tested.set(c.ip, d);
     const prog = `${tested.size}/${testQueue.length}`;       // 整体进度，让用户看到还在动
     const srcTag = srcTagOf(c);
@@ -431,9 +469,17 @@ try {
     } else {
       log(`   ${prog} ✗ ${c.ip} 失败(${d.err})${srcTag}`);
     }
+    if (!d.ok && /限速\(429\)|被拒\(403\)/.test(String(d.err))) limitedEarly.add(c.ip);
   });
   // 精测阶段结束提示
   if (survivors.length) log(`精测完成：共测 ${tested.size} 个存活节点`);
+  if (limitedEarly.size) {
+    log(`⚠ 精测里有 ${limitedEarly.size} 个节点被 Cloudflare 限速/拒绝（429/403）—— 这是「此刻被我们打限流了」，不是「节点本身慢」：`);
+    log(`   ${[...limitedEarly].slice(0, 8).join(', ')}${limitedEarly.size > 8 ? ` …（共 ${limitedEarly.size} 个）` : ''}`);
+    if (limitedEarly.size >= tested.size && tested.size > 0) {
+      log(`   注意：本轮存活节点**全部**被限流，通常是短时间内反复测速把这个 IP 打限了（生产环境一天两次不会这样），等一会儿再跑即可。`);
+    }
+  }
 
   // ── 更新数据源表现档案（供下次按表现排序）────────────────────
   {
@@ -493,38 +539,101 @@ try {
   const verifySec = Number(F.verifyDurationSec ?? 3.0);
   const warmSec = Number(F.verifyWarmSec ?? 0.8);
   log(`---- 复核 ${finalists.length} 名（${F.verifyRounds} 轮串行，每轮严格跑 ${verifySec} 秒求稳态极限）----`);
+  const limitedIps = new Set();
   for (let r = 1; r <= F.verifyRounds; r++) {
     let i = 0;
     for (const c of finalists) {
       i++;
-      const d = await downloadTimed(c.ip, c.port, verifySec, warmSec, p => {
+      const d = await downloadTimedMulti(c.ip, c.port, verifySec, warmSec, CONN, p => {
         log(`   复核 第${r}轮 [${i}/${finalists.length}] ${c.ip.padEnd(15)} 测速中(${p.elapsedSec}s) ${p.curMbps}Mbps`);
-      });
+      }, METRIC, LIMFAIL);
       (c.samples ||= []).push(d);
-      const st = d.ok ? `${d.mbps}Mbps (稳态)` : `失败(${d.err})`;
+      if (Number(d.limitedCount) > 0) limitedIps.add(c.ip);
+      const wait = Number(d.retryAfter) > 0 ? `，需等待约 ${Math.round(Number(d.retryAfter) / 60)} 分钟` : '';
+      const partial = Number(d.limitedCount) > 0 ? `（${d.connections} 条连接里有 ${d.limitedCount} 条被限速）` : '';
+      const st = d.ok ? `${d.mbps}Mbps (稳态)${partial}` : `失败(${d.err}${wait})`;
       log(`   复核 第${r}轮 [${i}/${finalists.length}] ${c.ip.padEnd(15)} → ${st}`);
     }
   }
+  if (limitedIps.size) {
+    log(`⚠ 有 ${limitedIps.size} 个节点被 Cloudflare 限速/拒绝（429/403）—— 这是「此刻被限流」，不是「节点本身慢」，本轮已跳过：`);
+    log(`   ${[...limitedIps].slice(0, 8).join(', ')}${limitedIps.size > 8 ? ` …（共 ${limitedIps.size} 个）` : ''}`);
+  }
   // 最终排名用大样本复核结果，并以真实速度重新判定达标
   // 排序：直接按实测速度从快到慢（延迟只作为并列时的次键，不参与主要排序）
+  const JITTER_W = 2.0;   // 波动惩罚权重（见下方排序注释）
   const ranked = finalists.map(c => {
     const ok = (c.samples || []).filter(s => s.ok);
     // colo 取自复核样本里最常见的那一个（anycast 可能换落点，取众数比取最后一次更稳）
     const coloCount = {};
     for (const s of ok) if (s.colo) coloCount[s.colo] = (coloCount[s.colo] || 0) + 1;
     const colo = Object.keys(coloCount).sort((a, b) => coloCount[b] - coloCount[a])[0] || '';
-    return { ...c, colo, mbps: median(ok.map(s => s.mbps)) || c.mbps, ttfb: median(ok.map(s => s.ttfb)) || c.ttfb, okRate: ok.length / Math.max(1, (c.samples || []).length) };
+    const vals = ok.map(s => s.mbps);
+    const mbps = median(vals) || c.mbps;
+    const minMbps = vals.length ? Math.min(...vals) : 0;
+    const maxMbps = vals.length ? Math.max(...vals) : 0;
+    const jitter = maxMbps > 0 ? (maxMbps - minMbps) / maxMbps : 0;   // 0 = 两轮完全一致
+    // 综合得分：速度 ÷ 波动惩罚。借鉴 cfnb 的 MIT 公式 `score = SPEED_WEIGHT*speed / penalty`
+    //（它算的是延迟抖动 penalty = 1 + w*jitter，这里把抖动换成「速度的相对波动」）
+    const score = +(mbps / (1 + JITTER_W * jitter)).toFixed(2);
+    return {
+      ...c, colo, mbps,
+      ttfb: median(ok.map(s => s.ttfb)) || c.ttfb,
+      minMbps, maxMbps, jitter, score,
+      // 复核期间只要有一条连接被限速，这次测出来的速度就是被削过的（多连接「一条成功即算成功」
+      //   会把 429 悄悄藏起来 —— 实测有节点 4 条里 3 条吃 429，却仍报出 57Mbps）。打标让位。
+      limited: (c.samples || []).some(s => Number(s.limitedCount) > 0) ? 1 : 0,
+      limitedCount: (c.samples || []).reduce((a, s) => a + (Number(s.limitedCount) || 0), 0),
+      okRate: ok.length / Math.max(1, (c.samples || []).length)
+    };
   }).filter(r => r.okRate >= 0.5)
-    .sort((a, b) => b.mbps - a.mbps || a.ttfb - b.ttfb);
+    // 【排序：达标 → 成功率 → 是否被限速 → 综合得分（速度÷波动）】
+    //   框架照搬 CFData-WEB 的 sortNSBResults（combined_refactor/tasks_nsb.go:395-421：
+    //   speedQualified↓ → lossRate↓ → downloadSpeed↓ → tcpDuration↑）。
+    //   但实测发现它的第二主键（丢包率）在本项目里几乎恒等于 100%：
+    //   CF 节点很少真的 ECONNRESET，只是忽快忽慢 —— 同一节点两轮 15.32Mbps 与 53.84Mbps 都算「成功」。
+    //   所以再补一层波动惩罚，让「两轮都稳」的节点胜过「一轮飙高、一轮趴窝」的。
+    .sort((a, b) => {
+      const aq = a.mbps >= target ? 1 : 0, bq = b.mbps >= target ? 1 : 0;
+      if (aq !== bq) return bq - aq;                                  // 1) 达标的优先
+      if (b.okRate !== a.okRate) return b.okRate - a.okRate;          // 2) 成功率高的优先（CFData-WEB 原主键）
+      if (a.limited !== b.limited) return a.limited - b.limited;      // 3) 复核时没被限速的优先
+      return b.score - a.score || b.mbps - a.mbps || a.ttfb - b.ttfb; // 4) 综合得分 → 速度 → 延迟
+    });
 
-  const passed = ranked.filter(r => r.mbps >= target);
-  log('---- 复核排名（按实测速度）----');
+  // 【最低速度门槛 acceptMinMbps】把「最差一轮都不够快」的节点直接剔掉。
+  //   为什么看「最低值」而不是中位数：中位速度漂亮、但某一轮掉到很低的节点（波动大），
+  //   写进 DNS 后就是"时快时卡"，正是最该避免的那种。
+  //   规则：minFloor > 0 时只保留 minMbps ≥ minFloor 的节点；若一个都不剩，
+  //         退而取中位速度最高的 1 个保底 —— 不能因为门槛把站点搞成打不开。
+  const minFloor = Math.max(0, Number(F.acceptMinMbps ?? 0));
+  let floorFallback = false;
+  let rankedOut = ranked;
+  if (minFloor > 0) {
+    const passFloor = ranked.filter(r => r.minMbps >= minFloor);
+    if (passFloor.length) {
+      rankedOut = passFloor;
+      log(`最低速度门槛 ${minFloor}Mbps：${ranked.length} 个候选里 ${passFloor.length} 个通过（剔除 ${ranked.length - passFloor.length} 个最差一轮不够快的）`);
+    } else {
+      rankedOut = [...ranked].sort((a, b) => b.mbps - a.mbps).slice(0, 1);
+      floorFallback = true;
+      log(`最低速度门槛 ${minFloor}Mbps：${ranked.length} 个候选全部低于此值 —— 只取速度最高的 1 个保底（${rankedOut[0]?.ip || '无'}），本轮不凑满 ${F.uploadCount} 个`);
+      log(`   现役里仍能满足 ${minFloor}Mbps 的会一并保留，不合格的随之删除（门槛是硬线，不因"现役"放宽）`);
+    }
+  }
+  const passed = rankedOut.filter(r => r.mbps >= target);
+  log('---- 复核排名（达标 → 成功率 → 是否被限速 → 综合得分）----');
   for (const r of ranked) {
     const mark = r.mbps >= target ? '✔ 达标' : `✘ 低于${target}`;
     const colo = r.colo ? ` ${String(r.colo).padEnd(4)}` : '';
-    log(`   ${r.ip.padEnd(16)} ${String(r.cc).padEnd(4)}${colo} ${String(r.mbps).padStart(7)}Mbps  ttfb=${String(r.ttfb).padStart(4)}ms  ${mark}`);
+    const stab = `稳定${String(Math.round(r.okRate * 100)).padStart(3)}%`;
+    const jit = ` 波动${String(Math.round(r.jitter * 100)).padStart(3)}%`;
+    const floor = ` 最低${String(r.minMbps).padStart(6)}Mbps`;
+    const lim = r.limited ? `  ⚠限速(${r.limitedCount}条)` : '';
+    const cut = (minFloor > 0 && !passed.includes(r)) ? '  ⊘ 最低值不够，已剔除' : '';
+    log(`   ${r.ip.padEnd(16)} ${String(r.cc).padEnd(4)}${colo} ${String(r.mbps).padStart(7)}Mbps  ttfb=${String(r.ttfb).padStart(4)}ms  ${stab}${jit}${floor}  ${mark}${lim}${cut}`);
   }
-  log(`复核结论：${passed.length}/${ranked.length} 个真实达标（≥${target}Mbps）`);
+  log(`复核结论：${passed.length}/${ranked.length} 个入选（达标 ≥${target}Mbps${minFloor > 0 ? ` 且最低一轮 ≥${minFloor}Mbps` : ''}）`);
   if (!passed.length) throw new Error(`复核后没有节点达到 ${target}Mbps，保留现有 DNS 记录不变`);
   // 后续方案只用真正达标的节点
   const finalRanked = passed;
@@ -569,10 +678,23 @@ try {
     // 【保住现役能用的】只是「数量不够、要补齐」时（healthAllDead=false），
     //   现役达标的 IP 优先占位，只用新优选的补足空额，
     //   避免为了凑够 5 个而把正在正常工作的 3 个也一起换掉。
+    //   【门槛是硬线】保留的现役同样要过 acceptMinMbps —— 不因为「它是现役」就放宽。
+    //   （2026-11-13 踩过的坑：minFloor=60 触发保底时把 5 个现役全删成 1 个，
+    //     站点从五重冗余变成单点。现在改成「合格才留」，保底时若现役也不合格，
+    //     就只写候选里最好的那 1 个 —— 宁可少，不可低于门槛。）
+    //   判定值优先取复核里的最差一轮 minMbps（现役也参与复核）；
+    //   若该 IP 没挤进复核名额，退回体检实测值。
     let keptInUse = [];
     if (!relaxed && !healthAllDead && goodNow.length) {
       const pickedIps = new Set(picked.map(r => r.ip));
-      keptInUse = goodNow.filter(g => !pickedIps.has(g.ip));
+      const rankOf = new Map(ranked.map(r => [r.ip, r]));
+      keptInUse = goodNow.filter(g => {
+        if (pickedIps.has(g.ip)) return false;
+        if (minFloor <= 0) return true;
+        const m = rankOf.get(g.ip);
+        const worst = m ? Math.min(Number(m.minMbps ?? m.mbps), Number(m.mbps)) : Number(g.mbps);
+        return worst >= minFloor;
+      });
       if (keptInUse.length) {
         const room = Math.max(0, limit - picked.length);
         const keep = keptInUse.slice(0, room);
